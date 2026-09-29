@@ -150,9 +150,19 @@ class FasterWhisperEngine(Engine):
             from faster_whisper import WhisperModel
         except ImportError as exc:
             raise AsrUnavailable(f"faster-whisper is not installed: {exc}")
-        log.info("loading Whisper model %r (first run downloads it)", self.model_name)
-        self._model = WhisperModel(self.model_name, device="cpu", compute_type="int8",
-                                   cpu_threads=self.threads or 0)
+        options = dict(device="cpu", compute_type="int8", cpu_threads=self.threads or 0)
+        # The cached copy first, without asking the Hugging Face hub if it is
+        # still current. With no network that question fails at once, but on
+        # Wi-Fi with no internet it waits out its retries: 135 s measured
+        # before it fell back to the cache anyway. The radio needs neither.
+        try:
+            self._model = WhisperModel(self.model_name, local_files_only=True, **options)
+            log.info("loaded Whisper model %r from the local cache", self.model_name)
+            return
+        except Exception as exc:
+            log.info("Whisper model %r is not cached yet (%s); downloading it, once",
+                     self.model_name, type(exc).__name__)
+        self._model = WhisperModel(self.model_name, **options)
 
     def _transcribe(self, pcm: bytes) -> str:
         import numpy as np

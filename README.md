@@ -49,6 +49,23 @@ chat (or move in the list), and **Tab** opens the quick replies. Keys only
 count while the Messenger has the screen. It is picked up within 2 s of
 plugging it in; see [controls/keys.py](controls/keys.py).
 
+### Without Wi-Fi or internet
+
+It needs neither. Messages go radio to radio over LoRa, speech is
+recognised on the board, and the screen and button are local.
+Internet is needed only to **install**: `./setup.sh` fetches the
+packages, the speech engine and its model, once.
+
+- **faster-whisper** loads its model from the local cache, without
+  asking the internet whether it is still current. That question used
+  to cost 135 s on Wi-Fi with no internet, such as a phone hotspot with
+  no data, while the screen said "Loading speech model…". **Vosk** only
+  ever reads its model folder.
+- **The clock** comes from the internet. Neither board has a
+  battery-backed clock, so without internet the times in the chat can be
+  wrong after a power cut. Messages, duplicate checks and delivery do not
+  depend on the time of day.
+
 ---
 
 ## How it works
@@ -335,7 +352,7 @@ controls/            button.py (hold/click gestures) · keys.py (a keyboard on t
                      keyboard.py (typing over SSH)
 messaging/           sender.py (ACK/retry) · receiver.py · history.py
 tools/               sim_air.py · linktest.py · launch_via_daemon.py
-tests/               131 tests; fakes.py models the E22 module
+tests/               133 tests; fakes.py models the E22 module
 ```
 
 ---
@@ -380,10 +397,15 @@ tests/               131 tests; fakes.py models the E22 module
   then.
 - Config: `messaging.quick_replies`, `ui.chat_messages`,
   `input.physical_keyboard`.
+- faster-whisper loads a cached model with `local_files_only`. On Wi-Fi
+  with no internet, its check for a newer model took 135 s before it
+  fell back to the cache. See
+  [Without Wi-Fi or internet](#without-wi-fi-or-internet).
 
 #### Validation
-- `python3 -m pytest tests -q`: **131 passed** on the development
-  machine, the Orange Pi and the Pi Zero.
+- `python3 -m pytest tests -q`: **133 passed** on the development
+  machine and the Pi Zero. The Orange Pi was off Wi-Fi for the last
+  fixes, so it last ran the 129 before them, all passing.
   - New: `test_chat.py` (14: the 10 shown, left and right, titles,
     delivery marks, hints, quick replies by hold and click, resend from
     the list, typing, Esc, arrows, no keys without the screen) and
@@ -393,6 +415,17 @@ tests/               131 tests; fakes.py models the E22 module
   - Also new: display tests for the layout (left and right by pixel
     colour, the newest lowest, overflow off the top, the long-name
     header) and the sender race. The race test fails without the fix.
+- Loading Whisper and transcribing the JFK sample through
+  `main.py --transcribe` (same faster-whisper 1.2.1 and huggingface_hub
+  1.33 as the Orange Pi):
+
+  | Network | Before | After |
+  |---|---|---|
+  | Online | 0.9 s | 0.6 s |
+  | No network (`unshare -rn`) | 0.7 s | 0.6 s |
+  | Wi-Fi, no internet (unanswered proxy) | 135 s | 0.6 s |
+
+  The transcript was word for word each time.
 - Orange Pi: `./setup.sh` installed faster-whisper and tiny.en without
   sudo. `./run.sh --transcribe jfk.wav` gave the sentence word for word,
   loading in 2.9 s and transcribing 11 s of audio in 5.9 s.

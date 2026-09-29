@@ -135,3 +135,35 @@ def test_model_loads_once_however_it_is_asked_for():
     engine.transcribe(sine(300, 1.0, 16000))
     engine.transcribe(sine(300, 1.0, 16000))
     assert Counting.loads == 1 and engine.ready
+
+
+class FakeWhisperModel:
+    """faster_whisper.WhisperModel that knows which models are cached."""
+    cached = set()
+    calls = []
+
+    def __init__(self, name, local_files_only=False, **options):
+        FakeWhisperModel.calls.append(local_files_only)
+        if local_files_only and name not in FakeWhisperModel.cached:
+            raise FileNotFoundError(f"{name} is not in the cache")
+
+
+def load_whisper(monkeypatch, cached):
+    import sys
+    import types
+    fake = types.ModuleType("faster_whisper")
+    fake.WhisperModel = FakeWhisperModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake)
+    FakeWhisperModel.cached, FakeWhisperModel.calls = cached, []
+    stt.FasterWhisperEngine("tiny.en").load()
+    return FakeWhisperModel.calls
+
+
+def test_a_cached_whisper_model_loads_without_asking_the_internet(monkeypatch):
+    """On Wi-Fi with no internet, asking whether the model is current
+    waited 135 s before falling back to the cache."""
+    assert load_whisper(monkeypatch, cached={"tiny.en"}) == [True]
+
+
+def test_an_uncached_whisper_model_is_downloaded(monkeypatch):
+    assert load_whisper(monkeypatch, cached=set()) == [True, False]
