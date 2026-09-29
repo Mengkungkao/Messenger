@@ -4,10 +4,12 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
-if [ -d .venv ]; then
-    # shellcheck disable=SC1091
-    source .venv/bin/activate
-fi
+# The venv's own python, not `source .venv/bin/activate`: activate has the
+# folder the venv was made in written into it, so after Messager became
+# Messenger it quietly ran the system python3, without the ASR engine.
+# .venv/bin/python finds its venv wherever the folder is now.
+PYTHON=python3
+[ -x .venv/bin/python ] && PYTHON=.venv/bin/python
 
 export PYTHONUNBUFFERED=1
-exec python3 main.py "$@"
+exec "$PYTHON" main.py "$@"

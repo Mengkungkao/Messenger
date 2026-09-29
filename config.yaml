@@ -7,9 +7,12 @@
 radio:
   port: /dev/ttyS0
   uart_baud: 9600
-  # Written into the module by provision_radio.py; must match on both radios.
-  frequency_mhz: 868
-  air_speed: 9600
+  # What the module holds; must match on both radios. "auto" reads what
+  # WalkieTalkie provisioned it with (../WalkieTalkie/config.yaml), because
+  # both apps share the one module; without WalkieTalkie, 868 and 9600.
+  # A number here is only right if the module really holds it.
+  frequency_mhz: auto
+  air_speed: auto
   power_dbm: 22
   # This radio's address, 0-65534. "auto" derives it from the hostname,
   # so a Raspberry Pi and an Orange Pi with different hostnames need no
@@ -35,6 +38,11 @@ messaging:
   ack_timeout_seconds: 3.0
   max_retries: 3
   history_size: 200
+  # Two clicks opens these (a hold does too, on a radio without speech
+  # recognition): click moves, hold sends. Keep the quotes: YAML reads a
+  # bare Yes or No as true/false.
+  quick_replies: ["OK", "Yes", "No", "On my way", "Where are you?", "Call me",
+                  "Wait 5 minutes", "Thank you"]
 
 audio:
   capture_device: auto        # or e.g. plughw:2 for a USB microphone
@@ -63,9 +71,11 @@ ui:
   idle_dim_seconds: 30
   idle_dim_brightness: 15
   idle_off_seconds: 0
+  chat_messages: 10           # the latest messages, sent and received, on screen
 
 input:
   debounce_ms: 75
   click_window_ms: 700
   hold_ms: 350
   keyboard: auto              # type messages on stdin when it is a terminal
+  physical_keyboard: true     # a USB/Bluetooth keyboard on the board: type, Enter sends

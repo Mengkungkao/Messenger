@@ -160,6 +160,9 @@ class FakeLink:
         self.accept = accept
         self.on_transmit = None
 
+    def round_trip_seconds(self, sent_bytes, reply_bytes):
+        return 0.0      # tests set ack_timeout to what they mean
+
     def transmit(self, packet):
         if not self.accept:
             return False

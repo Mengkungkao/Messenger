@@ -249,3 +249,61 @@ def test_name_fallbacks():
     history = h.History()
     assert history.name_for(0xFFFF) == "all"
     assert history.name_for(0x1A2B) == "#1A2B"
+
+
+# --- ACK wait and air rate -------------------------------------------------------
+
+def test_ack_wait_grows_as_the_air_rate_drops():
+    from lora.link import Link
+
+    class Radio:
+        uart_baud = 9600
+
+    full = pk.MAX_PACKET
+    waits = [Link(Radio(), rate).round_trip_seconds(full, pk.OVERHEAD)
+             for rate in (9600, 2400, 1200)]
+    assert waits == sorted(waits)
+    assert 0.5 < waits[0] < 1.2           # a full message and its ACK at 9.6k
+    assert waits[2] > 2.0                 # most of the old fixed 3 s at 1.2k
+
+
+def test_an_ack_still_on_the_air_is_not_resent_for(tmp_path, monkeypatch):
+    import messaging.sender as sender_module
+    monkeypatch.setattr(sender_module.random, "uniform", lambda a, b: 0.0)
+    link = FakeLink()
+    link.round_trip_seconds = lambda sent, reply: 0.3
+    history = h.History()
+    sender = Sender(link, history, ME, protocol.MessageIds(), ack_timeout=0.1,
+                    max_retries=2)
+    sender.start()
+    try:
+        link.on_transmit = lambda p: p.type == pk.TEXT and threading.Timer(
+            0.25, sender.handle_ack, [protocol.ack_packet(THEM, p)]).start()
+        [message] = sender.send_text("slow air")
+        assert wait_for(lambda: message.status == h.DELIVERED)
+        assert message.attempts == 1       # a bare 0.1 s wait would have resent
+    finally:
+        sender.stop()
+
+
+def test_an_ack_just_as_the_sender_gives_up_still_counts(tmp_path):
+    """The window between "failed" and "no longer in flight": an ACK there
+    was taken for the pending message and lost."""
+    link = FakeLink()
+    history = h.History()
+    sender = Sender(link, history, ME, protocol.MessageIds(), ack_timeout=0.05,
+                    max_retries=0)
+    acked = []
+
+    def ack_the_moment_it_fails(message):
+        if message.status == h.FAILED and not acked:
+            acked.append(sender.handle_ack(protocol.ack_packet(THEM, link.sent[0])))
+
+    history.subscribe(ack_the_moment_it_fails)
+    sender.start()
+    try:
+        [message] = sender.send_text("just in time")
+        assert wait_for(lambda: acked)
+        assert acked == [True] and message.status == h.DELIVERED
+    finally:
+        sender.stop()

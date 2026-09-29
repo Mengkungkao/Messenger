@@ -35,6 +35,9 @@ body = {
         # so the daemon's 4-clicks-in-3-seconds exit would fire while
         # reading.
         "exit_gesture": "none",
+        # Esc on a plugged-in keyboard cancels typing here (controls/keys.py);
+        # left on, the daemon would take it as "quit the app".
+        "disable_esc_exit_key": True,
         "priority": 44,
         "persist": True,
         "use_daemon_default_log": True,

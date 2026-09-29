@@ -68,3 +68,27 @@ def test_sim_air_splits_host_writes_into_packets():
     buffer.extend(second[4:])
     assert take_packet(buffer) == second
     assert not buffer
+
+
+def test_run_sh_uses_the_venv_python_wherever_the_folder_moved(tmp_path):
+    """A venv made under ~/Messager: its activate points at a folder that
+    no longer exists, and run.sh used to fall back to the system python3."""
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    project = tmp_path / "Messenger"
+    (project / ".venv" / "bin").mkdir(parents=True)
+    shutil.copy(Path(config_module.PROJECT_ROOT) / "run.sh", project / "run.sh")
+    (project / ".venv" / "bin" / "activate").write_text(
+        'export PATH="/home/mengpi/Messager/.venv/bin:$PATH"\n')
+    venv_python = project / ".venv" / "bin" / "python"
+    venv_python.write_text('#!/bin/sh\necho "venv python $*"\n')
+    venv_python.chmod(0o755)
+    (project / "main.py").write_text("print('system python')\n")
+
+    run = lambda: subprocess.run(["bash", str(project / "run.sh"), "--headless"],
+                                 capture_output=True, text=True, cwd=tmp_path).stdout
+    assert run().strip() == "venv python main.py --headless"
+    shutil.rmtree(project / ".venv")
+    assert run().strip() == "system python"

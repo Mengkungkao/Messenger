@@ -128,6 +128,7 @@ def make_app(tmp_path, monkeypatch, module, name, address):
     config.identity.name = name
     config.radio.address = address
     config.input.keyboard = "off"
+    config.input.physical_keyboard = False   # never read the test machine's keyboard
     config.asr.engine = "none"
     config.messaging.ack_timeout_seconds = 0.3
     config.ui.idle_dim_seconds = 0
@@ -136,6 +137,13 @@ def make_app(tmp_path, monkeypatch, module, name, address):
     app.asr = FakeEngine("Meet me at five o'clock")
     app.player.device = None             # no beeps from the test machine
     return app
+
+
+def last(app):
+    """The newest bubble in the chat, or an empty one."""
+    from display.whisplay import Bubble
+    bubbles = app.view().bubbles
+    return bubbles[-1] if bubbles else Bubble("", False)
 
 
 def test_final_demonstration(tmp_path, monkeypatch):
@@ -156,17 +164,19 @@ def test_final_demonstration(tmp_path, monkeypatch):
         assert pi.view().status.startswith("Listening")
         pi._on_talk_end(held_seconds=2.0)
 
-        # Pi: recognised text shown locally, then delivered.
-        assert wait_for(lambda: pi.view().tx_line == "TX: Message delivered ✓")
+        # Pi: recognised text shown locally, on the right, then delivered.
+        assert wait_for(lambda: last(pi).meta.endswith("✓"))
         view = pi.view()
-        assert view.message == "Meet me at five o'clock"
-        assert view.label == "TX → all"
+        assert view.bubbles[-1].text == "Meet me at five o'clock"
+        assert view.bubbles[-1].mine and view.bubbles[-1].meta_tone == "ok"
+        assert view.title == "OrangePi"
 
-        # Orange Pi: received, validated, displayed with the sender's name.
+        # Orange Pi: received, validated, on the left, under the sender's name.
         view = orange.view()
-        assert view.label == "RX: RasPi"
-        assert view.message == "Meet me at five o'clock"
-        assert wait_for(lambda: "-91 dBm" in orange.view().meta)
+        assert view.title == "RasPi"
+        assert view.bubbles[-1].text == "Meet me at five o'clock"
+        assert not view.bubbles[-1].mine
+        assert wait_for(lambda: "-91 dBm" in last(orange).meta)
     finally:
         pi.stop()
         orange.stop()
@@ -195,25 +205,33 @@ def test_slip_of_the_finger_is_not_transcribed(tmp_path, monkeypatch):
     assert app.view().status.startswith("Too short")
 
 
-def test_history_browsing_and_resend(tmp_path, monkeypatch):
+def test_scrolling_back_and_resending_a_failed_message(tmp_path, monkeypatch):
     left, _ = FakeModule.pair()
     app = make_app(tmp_path, monkeypatch, left, "RasPi", PI)
     for index in range(3):
         app.history.add(h.Message(h.RX, index + 1, ORANGE, f"msg {index}", h.RECEIVED))
     failed = app.history.add(h.Message(h.TX, 9, protocol.BROADCAST, "lost", h.FAILED))
-    assert app.view().message == "lost" and app.view().position == ""
+    view = app.view()
+    assert [b.text for b in view.bubbles] == ["msg 0", "msg 1", "msg 2", "lost"]
+    assert view.anchor is None and view.position == ""
+    assert view.bubbles[-1].failed and "not confirmed" in view.bubbles[-1].meta
     app._on_gesture("single")
-    assert app.view().message == "msg 2" and app.view().position == "3/4"
+    view = app.view()
+    assert view.anchor == 2 and view.position == "3/4" and view.bubbles[2].selected
     app._on_gesture("single")
     app._on_gesture("single")
-    assert app.view().message == "msg 0"
+    assert app.selected().text == "msg 0"
     app._on_gesture("single")
-    assert app.cursor is None            # wrapped back to live
-    app.cursor = 3
+    assert app.scroll == 0 and app.selected() is None     # past the oldest: back to now
+    # A reply arrives after the failed message; one click back selects it.
+    app.history.add(h.Message(h.RX, 7, ORANGE, "after", h.RECEIVED))
+    app._on_gesture("single")
+    assert app.selected() is failed
+    assert app.view().status == "2×: resend · 1×: older"
     app.sender.start()
     try:
-        app._on_gesture("double")          # resend the selected failed one
-        assert app.cursor is None
+        app._on_gesture("double")
+        assert app.scroll == 0 and app.picker is None
         assert wait_for(lambda: failed.status in (h.SENDING, h.FAILED) and failed.attempts)
     finally:
         app.sender.stop()

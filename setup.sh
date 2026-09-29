@@ -65,6 +65,11 @@ fi
 step "System packages"
 PACKAGES=(python3-serial python3-yaml python3-pil python3-numpy python3-venv alsa-utils)
 OPTIONAL=(espeak-ng)   # only for reading messages aloud
+# Without python3-venv, a venv can still be made --without-pip and filled
+# by the system's pip -- no sudo needed, which matters on a board whose
+# owner is not at the keyboard.
+SYSTEM_PIP=0
+python3 -m pip --version >/dev/null 2>&1 && { SYSTEM_PIP=1; OPTIONAL+=(python3-venv); }
 MISSING=()
 for pkg in "${PACKAGES[@]}" "${OPTIONAL[@]}"; do
     dpkg -s "$pkg" >/dev/null 2>&1 && ok "$pkg" || { warn "$pkg missing"; MISSING+=("$pkg"); }
@@ -82,7 +87,8 @@ if [ ${#MISSING[@]} -gt 0 ]; then
         if [ ${#REQUIRED_MISSING[@]} -gt 0 ]; then
             bad "needed: sudo apt install ${REQUIRED_MISSING[*]}"
         else
-            info "optional, for read-aloud: sudo apt install ${MISSING[*]}"
+            info "optional: sudo apt install ${MISSING[*]}"
+            info "(espeak-ng reads messages aloud; python3-venv is covered by the system pip)"
         fi
     fi
 fi
@@ -97,7 +103,14 @@ if [ "$ASR" = none ]; then
 else
     if [ ! -x .venv/bin/python ]; then
         if ask "create .venv (it sees the apt packages too)?"; then
-            python3 -m venv --system-site-packages .venv && ok ".venv created" || bad "venv failed"
+            if python3 -m venv --system-site-packages .venv >/dev/null 2>&1; then
+                ok ".venv created"
+            elif [ "$SYSTEM_PIP" = 1 ] && rm -rf .venv \
+                    && python3 -m venv --without-pip --system-site-packages .venv; then
+                ok ".venv created without its own pip; the system pip fills it"
+            else
+                bad "venv failed: sudo apt install python3-venv"
+            fi
         fi
     fi
     if [ -x .venv/bin/python ]; then
@@ -108,8 +121,17 @@ else
             # Wheels only for the compiled parts: without one for this
             # board, building CTranslate2 on a Zero 2 W takes hours or runs
             # out of memory. Better to fail here and suggest --asr vosk.
-            .venv/bin/pip install -q --only-binary=ctranslate2,onnxruntime,av,tokenizers,vosk \
-                "$PIP_PKG" pytest && ok "installed" \
+            # pytest>=7: the ASR engine brings anyio, whose pytest plugin
+            # breaks an older system pytest that the venv would otherwise use.
+            # A venv made --without-pip borrows the system pip, which can
+            # be too old: Ubuntu 22.04's 22.0.2 crashes resolving
+            # faster-whisper ("assert len(weights) == expected_node_count").
+            # It can still install a current pip into the venv, which then
+            # does the rest.
+            [ -x .venv/bin/pip ] || .venv/bin/python -m pip install -q --upgrade pip \
+                || bad "could not put a current pip into .venv"
+            .venv/bin/python -m pip install -q --only-binary=ctranslate2,onnxruntime,av,tokenizers,vosk \
+                "$PIP_PKG" "pytest>=7" && ok "installed" \
                 || bad "pip install failed (no wheel for this board? try --asr vosk)"
         fi
         if [ "$ASR" = faster-whisper ] && [ "$CHECK_ONLY" = 0 ]; then
@@ -126,6 +148,8 @@ else
                     https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip \
                     && (cd models && python3 -m zipfile -e vosk.zip . && rm vosk.zip) \
                     && ok "$VOSK_MODEL" || bad "vosk model download failed"
+            else
+                bad "no vosk model at $VOSK_MODEL: speech cannot be recognised"
             fi
             USING=$(python3 -c "import config; a = config.load().asr; print(a.engine, a.model)" 2>/dev/null | tail -1)
             if [ "$USING" = "vosk $HERE/$VOSK_MODEL" ]; then
@@ -197,12 +221,32 @@ fi
 
 # ------------------------------------------------------------- the radio
 step "Radio module"
-info "The module keeps its frequency and air rate in non-volatile memory."
-info "A module already provisioned for WalkieTalkie is ready as it is."
-info "Otherwise, once, on a Raspberry Pi:"
-info "    sudo systemctl stop whisplay-daemon"
-info "    python3 provision_radio.py --frequency 868"
-info "    sudo systemctl start whisplay-daemon"
+# One module, two apps: WalkieTalkie's provision_radio.py records what it
+# wrote in its config.yaml, and "auto" here reads it from there.
+read -r FREQ AIR WT_FREQ WT_AIR < <(python3 -c "
+import config
+radio, walkie = config.load().radio, config.module_settings()
+print(radio.frequency_mhz, radio.air_speed,
+      walkie.get('frequency_mhz', '-'), walkie.get('air_speed', '-'))" 2>/dev/null | tail -1)
+if [ "${WT_AIR:--}" = - ]; then
+    ok "config.yaml: ${FREQ:-?} MHz, ${AIR:-?} bps"
+    info "The module keeps its frequency and air rate in non-volatile memory,"
+    info "and both radios must match. If it does not hold these yet, once, on a Pi:"
+    info "    sudo systemctl stop whisplay-daemon"
+    info "    python3 provision_radio.py --frequency ${FREQ:-868} --air-speed ${AIR:-9600}"
+    info "    sudo systemctl start whisplay-daemon"
+elif [ "$FREQ $AIR" = "$WT_FREQ $WT_AIR" ]; then
+    ok "$FREQ MHz, $AIR bps: what WalkieTalkie provisioned the module with"
+    info "to change it: cd ../WalkieTalkie && sudo python3 provision_radio.py --range normal|long|longest"
+    info "(on both radios); the messenger follows"
+else
+    bad "config.yaml says $FREQ MHz, $AIR bps, but WalkieTalkie provisioned the module for $WT_FREQ MHz, $WT_AIR bps"
+    info "airtime would be counted at the wrong rate, and the duty cycle broken"
+    if ask "set radio.frequency_mhz and radio.air_speed to auto (follow WalkieTalkie)?"; then
+        sed -i -E "s|^(  frequency_mhz:).*|\1 auto|; s|^(  air_speed:).*|\1 auto|" config.yaml \
+            && ok "config.yaml: follows WalkieTalkie"
+    fi
+fi
 
 # ----------------------------------------------------------------- tests
 step "Tests"

@@ -21,6 +21,10 @@ from utils.logger import get_logger
 log = get_logger("link")
 
 MODULE_BROADCAST = 0xFFFF
+# The module takes a whole packet over the UART before it transmits, and
+# the far one puts it out on its UART only once it has all of it: 8N1 is
+# ten bits a byte, each way.
+UART_BITS_PER_BYTE = 10
 
 
 class Link:
@@ -28,6 +32,7 @@ class Link:
                  duty_cycle_percent: float = 1.0):
         self.radio = radio
         self.airtime = AirtimeBudget(air_speed, duty_cycle_percent)
+        self.uart_baud = getattr(radio, "uart_baud", 9600)
         self.deframer = pk.Deframer()
         self.on_packet = None       # callback(Packet)
         self.on_rssi = None         # callback(dBm) -- belongs to the last packet
@@ -90,6 +95,17 @@ class Link:
             self.tx_packets += 1
         log.debug("tx %s", packet)
         return True
+
+    def round_trip_seconds(self, sent_bytes: int, reply_bytes: int) -> float:
+        """Least time from sending a frame to its reply being read back.
+
+        Both frames cross two UARTs and the air. At 9600 bps a full
+        message and its ACK take about 0.9 s; at 2400, 1.4 s; at 1200,
+        2.2 s -- most of a fixed 3 s ACK wait.
+        """
+        uart = 2 * (sent_bytes + reply_bytes) * UART_BITS_PER_BYTE / self.uart_baud
+        return (uart + self.airtime.estimate(sent_bytes)
+                + self.airtime.estimate(reply_bytes))
 
     def stop(self):
         self._running = False

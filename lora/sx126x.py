@@ -31,6 +31,7 @@ Differences from the stock Waveshare `sx126x.py` that matter here:
 
 from __future__ import annotations
 
+import errno
 import os
 import threading
 import time
@@ -60,30 +61,44 @@ REOPEN_SECONDS = 2.0
 CMDLINE = "/proc/cmdline"
 
 
-def port_conflicts(port: str) -> list:
-    """What else is using this serial port, in words.
+class PortBusy(serial.SerialException):
+    """Another program has the radio's port locked -- WalkieTalkie, usually.
 
-    Anything else reading the port takes bytes meant for the radio -- a
-    fragment arrives short, fails its check, and the message arrives
-    broken or not at all -- and a login shell on it hangs the port up
-    whenever it restarts, which is what "[Errno 5] Input/output error" on
-    a write means. Only processes we may look at are seen, which covers
-    the case that matters: an auto-login shell runs as the same user.
+    Both apps lock the port when they open it, so the second one to start
+    is refused here instead of each silently getting half of every packet.
     """
-    problems = []
-    real = os.path.realpath(port)
-    name = os.path.basename(real)
-    aliases = {name, "serial0"} if name in ("ttyS0", "ttyAMA0") else {name}
-    try:
-        with open(CMDLINE) as handle:
-            arguments = handle.read().split()
-    except OSError:
-        arguments = []
-    if any(arg.startswith("console=") and arg[8:].split(",")[0] in aliases
-           for arg in arguments):
-        problems.append(f"the kernel console is on {name}")
 
+    def __init__(self, port: str, holders: list):
+        self.holders = holders
+        super().__init__(errno.EBUSY,
+                         f"{port} is in use by {', '.join(holders) or 'another program'}")
+
+
+def _describe(pid: str) -> str:
+    """A process in words: a Python app by its folder (WalkieTalkie,
+    Messenger), since both are just "python3" otherwise."""
+    try:
+        with open(f"/proc/{pid}/comm") as handle:
+            command = handle.read().strip()
+    except OSError:
+        return "a process"
+    if command.startswith("python"):
+        try:
+            return os.path.basename(os.readlink(f"/proc/{pid}/cwd")) or command
+        except OSError:
+            pass
+    return command
+
+
+def port_users(port: str) -> list:
+    """(who, pid) for each other process with this port open.
+
+    Only processes we may look at are seen, which covers the cases that
+    matter: the other app and an auto-login shell run as the same user.
+    """
+    real = os.path.realpath(port)
     own = os.getpid()
+    users = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit() or int(entry) == own:
             continue
@@ -97,13 +112,33 @@ def port_conflicts(port: str) -> list:
             except OSError:
                 continue
             if target == real:
-                try:
-                    with open(f"/proc/{entry}/comm") as handle:
-                        command = handle.read().strip()
-                except OSError:
-                    command = "a process"
-                problems.append(f"{command} ({entry}) has {name} open")
+                users.append((_describe(entry), int(entry)))
                 break
+    return users
+
+
+def port_conflicts(port: str) -> list:
+    """What else is using this serial port, in words.
+
+    Anything else reading the port takes bytes meant for the radio -- a
+    fragment arrives short, fails its check, and the message arrives
+    broken or not at all -- and a login shell on it hangs the port up
+    whenever it restarts, which is what "[Errno 5] Input/output error" on
+    a write means.
+    """
+    problems = []
+    real = os.path.realpath(port)
+    name = os.path.basename(real)
+    aliases = {name, "serial0"} if name in ("ttyS0", "ttyAMA0") else {name}
+    try:
+        with open(CMDLINE) as handle:
+            arguments = handle.read().split()
+    except OSError:
+        arguments = []
+    if any(arg.startswith("console=") and arg[8:].split(",")[0] in aliases
+           for arg in arguments):
+        problems.append(f"the kernel console is on {name}")
+    problems += [f"{who} ({pid}) has {name} open" for who, pid in port_users(port)]
     return problems
 
 
@@ -147,7 +182,14 @@ class SX126x:
         # timeout=None makes read(1) block in the kernel until a byte
         # arrives -- no wakeups, no polling, no CPU while the channel is
         # quiet. Provisioning passes a real timeout for its handshake.
-        ser = serial.Serial(self.port, self.uart_baud, timeout=self.read_timeout)
+        # exclusive=True takes an flock on the port; WalkieTalkie does too.
+        try:
+            ser = serial.Serial(self.port, self.uart_baud, timeout=self.read_timeout,
+                                exclusive=True)
+        except serial.SerialException as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise PortBusy(self.port, [who for who, _ in port_users(self.port)]) from exc
+            raise
         ser.reset_input_buffer()
         return ser
 

@@ -1,4 +1,4 @@
-"""The Whisplay screen: what the messenger shows, and getting it there.
+"""The Whisplay screen: the chat, and getting it onto the LCD.
 
 The Whisplay HAT daemon owns the hardware -- LCD, backlight, RGB LED and
 button -- and this module only ever talks to it through the client in
@@ -8,15 +8,19 @@ display/board.py. `render()` is a pure function from a `View` to a
 backlight.
 
     ┌──────────────────────────────┐
-    │        LoRa Messenger        │
+    │ 2/10    raspberrypi   -63dBm │  who, and how well we hear them
     ├──────────────────────────────┤
-    │ RX: OrangePi            3/12 │
-    │ 12:04 · #1024 · -91 dBm      │
-    │ "Hello, how are you?"        │
-    │                              │
-    │ TX: Message delivered ✓      │
-    │ [ Ready                    ] │
-    │   RasPi #1A2B · 868 MHz      │
+    │ ┌──────────────┐             │  received: left
+    │ │ Where are    │             │
+    │ │ you?         │             │
+    │ └──────────────┘             │
+    │ 12:03 · -63 dBm              │
+    │             ┌──────────────┐ │  sent: right
+    │             │ On my way    │ │
+    │             └──────────────┘ │
+    │                    12:04 ✓   │  delivered / sending… / ✗
+    │ > typing on a keyboard_      │  only while typing
+    │ [ Hold: talk · 2×: replies ] │  what the button does now
     └──────────────────────────────┘
 
 **Frames are only pushed when something changed.** On the stock LoRa
@@ -28,10 +32,9 @@ the radio has nothing to hear anyway.
 
 from __future__ import annotations
 
-import textwrap
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -52,11 +55,26 @@ OK = (64, 208, 138)         # received, delivered
 WARN = (245, 178, 62)       # in progress
 DANGER = (255, 92, 92)      # listening, failed
 
+THEIRS = (44, 50, 62)       # received bubble
+MINE = (30, 96, 186)        # sent bubble
+MINE_FAILED = (120, 40, 48)
+
 TONES = {"idle": SURFACE, "listen": DANGER, "busy": WARN, "ok": OK, "error": DANGER}
 TONE_TEXT = {"idle": TEXT, "listen": BG, "busy": BG, "ok": BG, "error": BG}
+META_TONES = {"dim": DIM, "ok": OK, "busy": WARN, "error": DANGER}
 
 LED = {"idle": (0, 6, 10), "listen": (60, 0, 0), "busy": (40, 24, 0),
        "ok": (0, 40, 16), "error": (60, 0, 0)}
+
+# Layout, in pixels.
+HEADER_H = 34
+STATUS_TOP, STATUS_BOTTOM = 240, 266     # kept inside the panel's rounded corners
+SIDE = 8                                 # gap between a bubble and the screen edge
+BUBBLE_MAX_W = 176
+PAD_X, PAD_Y = 9, 5
+TEXT_SIZE, LINE_H = 15, 19
+META_SIZE, META_H = 11, 14
+GAP = 5                                  # between one message and the next
 
 _FONTS = {
     "regular": ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -82,20 +100,39 @@ def font(size: int, weight: str = "regular"):
 
 
 @dataclass
+class Bubble:
+    """One message in the chat."""
+    text: str
+    mine: bool                  # sent by us: right-hand side
+    meta: str = ""              # "12:04 ✓", "12:03 · -63 dBm"
+    meta_tone: str = "dim"      # dim | ok | busy | error
+    sender: str = ""            # above a received bubble, when several radios talk
+    selected: bool = False      # scrolled to: what 3 clicks read, 2 clicks resend
+    failed: bool = False
+
+
+@dataclass
+class Picker:
+    """The quick-reply list, over the chat."""
+    items: list
+    index: int = 0
+    title: str = "Quick reply"
+
+
+@dataclass
 class View:
     """Everything on screen, as data."""
     title: str = "LoRa Messenger"
-    label: str = ""             # "RX: OrangePi" / "TX → all"
-    label_tone: str = "rx"      # rx | tx
-    meta: str = ""              # time, ID, signal
-    message: str = ""           # the text, unquoted
-    position: str = ""          # "3/12" while browsing history
-    tx_line: str = ""           # "TX: Message delivered ✓"
-    tx_tone: str = "idle"
+    signal: str = ""            # "-63 dBm", the last packet heard
+    position: str = ""          # "8/10" while scrolled back
+    bubbles: list = field(default_factory=list)     # oldest first
+    anchor: int | None = None   # bubble at the bottom when scrolled; None = newest
+    empty_hint: list = field(default_factory=list)  # lines shown with no messages
+    compose: str | None = None  # being typed on a keyboard
+    picker: Picker | None = None
     status: str = "Ready"
     status_tone: str = "idle"
     level: float = 0.0          # mic level 0..1 while listening
-    footer: str = ""
 
 
 def _width(draw, text, face) -> int:
@@ -140,81 +177,172 @@ def wrap(draw, text: str, face, width: int) -> list:
     return lines
 
 
-def render(view: View) -> Image.Image:
-    image = Image.new("RGB", (WIDTH, HEIGHT), BG)
-    draw = ImageDraw.Draw(image)
-    margin = 12
-    inner = WIDTH - 2 * margin
+# --- the parts of the screen ---------------------------------------------------
 
-    # Title bar.
-    draw.rectangle((0, 0, WIDTH, 36), fill=SURFACE)
-    draw.line((0, 36, WIDTH, 36), fill=BORDER)
-    face = font(18, "bold")
-    draw.text(((WIDTH - _width(draw, view.title, face)) // 2, 9), view.title,
-              font=face, fill=TEXT)
+def _header(draw, view: View):
+    draw.rectangle((0, 0, WIDTH, HEADER_H), fill=SURFACE)
+    draw.line((0, HEADER_H, WIDTH, HEADER_H), fill=BORDER)
+    # 12 px down, the panel's rounded corners are only 2 px in: the edge
+    # text can sit 8 px from the sides.
+    small = font(11)
+    left = _width(draw, view.position, small) + 10 if view.position else 0
+    right = _width(draw, view.signal, small) + 10 if view.signal else 0
+    # Centred on the screen when it fits there, else in the room left
+    # between the position and the signal: "orangepizero2w" must not lose
+    # half its name to symmetry.
+    lo, hi = 8 + left, WIDTH - 8 - right
+    for size in (16, 15, 14):               # a size smaller before an ellipsis
+        face = font(size, "bold")
+        if _width(draw, view.title, face) <= hi - lo:
+            break
+    title = _fit(draw, view.title, face, hi - lo)
+    width = _width(draw, title, face)
+    x = min(max((WIDTH - width) // 2, lo), hi - width)
+    draw.text((x, 8 + (16 - size) // 2), title, font=face, fill=TEXT)
+    if view.position:
+        draw.text((8, 12), view.position, font=small, fill=WARN)
+    if view.signal:
+        draw.text((WIDTH - 8 - _width(draw, view.signal, small), 12), view.signal,
+                  font=small, fill=DIM)
 
-    # Who and when.
-    y = 44
-    if view.label:
-        colour = OK if view.label_tone == "rx" else ACCENT
-        pos_face = font(12)
-        pos_w = _width(draw, view.position, pos_face) + 6 if view.position else 0
-        draw.text((margin, y), _fit(draw, view.label, font(17, "bold"), inner - pos_w),
-                  font=font(17, "bold"), fill=colour)
-        if view.position:
-            draw.text((WIDTH - margin - pos_w + 6, y + 4), view.position,
-                      font=pos_face, fill=DIM)
-    if view.meta:
-        draw.text((margin, y + 22), _fit(draw, view.meta, font(12), inner),
-                  font=font(12), fill=DIM)
 
-    # The message: as large as fits in the space.
-    top, bottom = 88, 196
-    if view.message:
-        quoted = f"“{view.message}”"
-        for size in (20, 17, 15, 13):
-            face = font(size)
-            line_h = size + 5
-            lines = wrap(draw, quoted, face, inner)
-            if len(lines) * line_h <= bottom - top:
-                break
-        max_lines = (bottom - top) // line_h
-        if len(lines) > max_lines:
-            lines = lines[:max_lines]
-            lines[-1] = _fit(draw, lines[-1] + "…", face, inner)
+def _bubble_block(draw, bubble: Bubble):
+    """(height, draw(canvas, y)) for one message: sender, bubble, meta line."""
+    face = font(TEXT_SIZE)
+    lines = wrap(draw, bubble.text, face, BUBBLE_MAX_W - 2 * PAD_X) or [""]
+    text_w = max(_width(draw, line, face) for line in lines)
+    bubble_w = text_w + 2 * PAD_X
+    bubble_h = len(lines) * LINE_H + 2 * PAD_Y - 2
+    sender_h = META_H if bubble.sender else 0
+    meta_h = META_H if bubble.meta else 0
+    height = sender_h + bubble_h + meta_h
+
+    def paint(canvas, y):
+        x = WIDTH - SIDE - bubble_w if bubble.mine else SIDE
+        small = font(META_SIZE)
+        if bubble.sender:
+            canvas.text((x + 2, y), _fit(canvas, bubble.sender, small, BUBBLE_MAX_W),
+                        font=small, fill=OK)
+            y += sender_h
+        fill = (MINE_FAILED if bubble.failed else MINE) if bubble.mine else THEIRS
+        canvas.rounded_rectangle((x, y, x + bubble_w, y + bubble_h), radius=9, fill=fill,
+                                 outline=WARN if bubble.selected else None,
+                                 width=2 if bubble.selected else 1)
         for index, line in enumerate(lines):
-            draw.text((margin, top + index * line_h), line, font=face, fill=TEXT)
+            canvas.text((x + PAD_X, y + PAD_Y - 1 + index * LINE_H), line, font=face,
+                        fill=TEXT)
+        if bubble.meta:
+            meta = _fit(canvas, bubble.meta, small, WIDTH - 2 * SIDE)
+            meta_x = (WIDTH - SIDE - 2 - _width(canvas, meta, small) if bubble.mine
+                      else x + 2)
+            canvas.text((meta_x, y + bubble_h + 1), meta, font=small,
+                        fill=META_TONES.get(bubble.meta_tone, DIM))
+
+    return height, paint
+
+
+def _chat(image, draw, view: View, top: int, bottom: int):
+    """Bubbles from the bottom up; whatever does not fit scrolls off the top."""
+    area = Image.new("RGB", (WIDTH, bottom - top), BG)
+    canvas = ImageDraw.Draw(area)
+    if not view.bubbles:
+        face = font(13)
+        lines = view.empty_hint or ["No messages yet"]
+        y = (bottom - top - len(lines) * 20) // 2
+        for index, line in enumerate(lines):
+            colour = TEXT if index == 0 else DIM
+            canvas.text(((WIDTH - _width(canvas, line, face)) // 2, y + index * 20), line,
+                        font=font(13, "bold") if index == 0 else face, fill=colour)
     else:
-        face = font(14)
-        hint = "Hold the button and speak"
-        draw.text(((WIDTH - _width(draw, hint, face)) // 2, (top + bottom) // 2 - 8),
-                  hint, font=face, fill=DIM)
+        last = len(view.bubbles) - 1 if view.anchor is None else view.anchor
+        newer = len(view.bubbles) - 1 - last
+        y = bottom - top - (22 if newer else 2)     # room for "▼ 2 newer"
+        for bubble in reversed(view.bubbles[:last + 1]):
+            height, paint = _bubble_block(canvas, bubble)
+            y -= height
+            paint(canvas, y)
+            y -= GAP
+            if y < 0:
+                break
+        if newer:
+            note = f"▼ {newer} newer"
+            small = font(META_SIZE, "bold")
+            w = _width(canvas, note, small) + 12
+            canvas.rounded_rectangle(((WIDTH - w) // 2, bottom - top - 18,
+                                      (WIDTH + w) // 2, bottom - top - 2),
+                                     radius=7, fill=WARN)
+            canvas.text(((WIDTH - w) // 2 + 6, bottom - top - 17), note, font=small, fill=BG)
+    image.paste(area, (0, top))
 
-    # Last transmission's fate.
-    draw.line((margin, 202, WIDTH - margin, 202), fill=BORDER)
-    if view.tx_line:
-        colour = {"ok": OK, "error": DANGER, "busy": WARN}.get(view.tx_tone, DIM)
-        draw.text((margin, 208), _fit(draw, view.tx_line, font(15, "bold"), inner),
-                  font=font(15, "bold"), fill=colour)
 
-    # Status pill, with the mic level while listening.
-    pill = (margin, 232, WIDTH - margin, 256)
-    draw.rounded_rectangle(pill, radius=8, fill=TONES.get(view.status_tone, SURFACE))
+def _compose(draw, text: str, bottom: int) -> int:
+    """The line being typed, above the status bar. Returns its top."""
+    face = font(14)
+    inner = WIDTH - 2 * SIDE - 16
+    lines = wrap(draw, f"{text}▏", face, inner) or ["▏"]
+    lines = lines[-2:]                      # the end is what is being typed
+    height = len(lines) * 18 + 8
+    top = bottom - height
+    draw.rounded_rectangle((SIDE, top, WIDTH - SIDE, bottom), radius=8, fill=SURFACE,
+                           outline=ACCENT, width=1)
+    for index, line in enumerate(lines):
+        draw.text((SIDE + 8, top + 4 + index * 18), line, font=face, fill=TEXT)
+    return top
+
+
+def _picker(draw, picker: Picker, top: int, bottom: int):
+    draw.rectangle((0, top, WIDTH, bottom), fill=BG)
+    face, bold = font(15), font(15, "bold")
+    draw.text((SIDE + 4, top + 4), picker.title, font=font(13, "bold"), fill=DIM)
+    back = "2×: back"
+    draw.text((WIDTH - SIDE - 4 - _width(draw, back, font(12)), top + 5), back,
+              font=font(12), fill=DIM)
+    row_h, first_y = 26, top + 24
+    rows = max(1, (bottom - first_y) // row_h)
+    count = len(picker.items)
+    # Keep the highlighted row in view, a little below the top when it can be.
+    start = min(max(0, picker.index - 1), max(0, count - rows))
+    for row, index in enumerate(range(start, min(count, start + rows))):
+        y = first_y + row * row_h
+        chosen = index == picker.index
+        if chosen:
+            draw.rounded_rectangle((SIDE, y, WIDTH - SIDE, y + row_h - 3), radius=8,
+                                   fill=MINE)
+        label = _fit(draw, str(picker.items[index]), bold if chosen else face,
+                     WIDTH - 2 * SIDE - 16)
+        draw.text((SIDE + 8, y + 3), label, font=bold if chosen else face,
+                  fill=TEXT if chosen else DIM)
+    if start > 0:
+        draw.text((WIDTH - SIDE - 14, first_y + 6), "▲", font=font(11), fill=DIM)
+    if start + rows < count:
+        draw.text((WIDTH - SIDE - 12, bottom - 14), "▼", font=font(11), fill=DIM)
+
+
+def _status(draw, view: View):
+    pill = (14, STATUS_TOP, WIDTH - 14, STATUS_BOTTOM)
+    draw.rounded_rectangle(pill, radius=9, fill=TONES.get(view.status_tone, SURFACE))
     if view.status_tone == "listen" and view.level > 0:
         fill_w = int((pill[2] - pill[0]) * min(1.0, view.level))
         draw.rounded_rectangle((pill[0], pill[1], pill[0] + fill_w, pill[3]),
-                               radius=8, fill=(255, 150, 150))
-    face = font(15, "bold")
-    status = _fit(draw, view.status, face, inner - 12)
-    draw.text(((WIDTH - _width(draw, status, face)) // 2, 235), status, font=face,
-              fill=TONE_TEXT.get(view.status_tone, TEXT))
+                               radius=9, fill=(255, 150, 150))
+    face = font(13, "bold")
+    status = _fit(draw, view.status, face, pill[2] - pill[0] - 12)
+    draw.text(((WIDTH - _width(draw, status, face)) // 2, STATUS_TOP + 5), status,
+              font=face, fill=TONE_TEXT.get(view.status_tone, TEXT))
 
-    # Footer, kept inside the panel's rounded bottom corners.
-    if view.footer:
-        face = font(11)
-        footer = _fit(draw, view.footer, face, WIDTH - 2 * CORNER_RADIUS - 8)
-        draw.text(((WIDTH - _width(draw, footer, face)) // 2, 262), footer,
-                  font=face, fill=DIM)
+
+def render(view: View) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), BG)
+    draw = ImageDraw.Draw(image)
+    _header(draw, view)
+    bottom = STATUS_TOP - 4
+    if view.compose is not None:
+        bottom = _compose(draw, view.compose, bottom) - 4
+    if view.picker is not None:
+        _picker(draw, view.picker, HEADER_H + 1, bottom)
+    else:
+        _chat(image, draw, view, HEADER_H + 1, bottom)
+    _status(draw, view)
     return image
 
 
@@ -327,6 +455,13 @@ class Screen:
         return float("inf")
 
     def restore(self):
-        """Hand the desktop back lit: the daemon never resets the backlight."""
+        """Hand the desktop back lit: the daemon never resets the backlight.
+
+        At 100% when the backlight pin is the radio's M0. Anything dimmer
+        is PWM on M0, and stays after we leave: a WalkieTalkie still
+        running in the background, or whatever uses the radio next, would
+        be deaf. WalkieTalkie hands it back at 100% for the same reason.
+        """
+        level = 100 if self._locked_reason else self.config.brightness
         self._locked_reason = None
-        self.set_backlight(self.config.brightness)
+        self.set_backlight(level)

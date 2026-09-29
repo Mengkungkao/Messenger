@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 TARGET="${POSITIONAL[0]:-}"
-REMOTE_DIR="${POSITIONAL[1]:-Messager}"
+REMOTE_DIR="${POSITIONAL[1]:-Messenger}"
 if [ -z "$TARGET" ]; then
     echo "usage: $0 user@host [remote-dir] [--setup] [--asr faster-whisper|vosk|none] [--yes]" >&2
     exit 1

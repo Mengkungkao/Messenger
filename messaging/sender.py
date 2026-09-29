@@ -8,6 +8,10 @@ time, so their order on the air is the order they were spoken. For each:
              -> ACK: DELIVERED, with the round-trip time
              -> still nothing: FAILED
 
+The wait is ack_timeout on top of the time the message and its ACK
+spend on the UARTs and the air, which grows as the air rate drops: at
+1200 bps a fixed 3 s would resend a message whose ACK was on its way.
+
 The jitter matters: two radios that both lost a packet to the same
 collision would otherwise retry in lock-step and collide again.
 
@@ -22,6 +26,7 @@ import random
 import threading
 import time
 
+from lora import packet as pk
 from lora import protocol
 from messaging import history as h
 from utils.logger import get_logger
@@ -133,6 +138,7 @@ class Sender:
     def _deliver(self, message: h.Message):
         packet = protocol.text_packet(self.address, message.peer, message.msg_id,
                                       message.text)
+        in_flight = self.link.round_trip_seconds(len(packet.encode()), pk.OVERHEAD)
         with self._lock:
             self._pending = message
             self._acked_by = None
@@ -149,7 +155,8 @@ class Sender:
                 self.history.update(message, attempts=attempt)
                 log.info("sent #%d to %s, attempt %d: %r", message.msg_id,
                          self.history.name_for(message.peer), attempt, message.text)
-                wait = self.ack_timeout + random.uniform(0, RETRY_JITTER_SECONDS)
+                wait = (self.ack_timeout + in_flight
+                        + random.uniform(0, RETRY_JITTER_SECONDS))
                 if self._ack.wait(wait) and self._acked_by is not None:
                     rtt = int((time.monotonic() - sent_at) * 1000)
                     self.history.update(message, status=h.DELIVERED, rtt_ms=rtt,
@@ -161,6 +168,11 @@ class Sender:
                     return   # leave it as SENDING; history marks it failed on load
             log.warning("#%d failed: no ACK after %d attempts", message.msg_id,
                         message.attempts)
+            # No longer in flight *before* it reads failed: an ACK landing in
+            # between would otherwise be taken for the pending message and
+            # dropped, and the message stay "not confirmed" though it arrived.
+            with self._lock:
+                self._pending = None
             self.history.update(message, status=h.FAILED)
         finally:
             with self._lock:

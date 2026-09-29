@@ -132,7 +132,10 @@ def sample(m0: int = DEFAULT_M0, m1: int = DEFAULT_M1,
 
     transparent = sum(1 for pair in seen if pair == (0, 0))
     fraction = transparent / len(seen)
-    worst = max(set(seen), key=seen.count)
+    # Name the state that deafens it, not the commonest: a backlight dimmed
+    # to 75% is transparent three reads in four, and deaf all the same.
+    others = [pair for pair in seen if pair != (0, 0)]
+    worst = max(set(others), key=others.count) if others else (0, 0)
     name, usable = MODES.get(worst, (f"M0={worst[0]} M1={worst[1]}", False))
     return {
         "readable": True,
@@ -171,7 +174,10 @@ def check_and_warn(m0: int = DEFAULT_M0, m1: int = DEFAULT_M1) -> dict:
         "packets were sent. Either something else is holding that line "
         "(the LCD drives GPIO 22/27, so a fitted M0/M1 jumper does exactly "
         "this), or the pin cannot sink it -- move that wire to another free "
-        "GPIO and update radio.mode_pins, or tie the pin to ground.",
+        "GPIO and update radio.mode_pins, or tie the pin to ground. M0 high "
+        "only part of the time is the backlight, dimmed by the last HAT app; "
+        "the messenger pins it at 100%% only while it has the screen, so not "
+        "with --headless.",
         result["detail"], m0, m1,
         " and ".join(f"GPIO{p}" for p in stuck) + (" is" if len(stuck) == 1 else " are"),
     )

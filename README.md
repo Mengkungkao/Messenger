@@ -1,10 +1,11 @@
 # LoRa Messenger
 
-Speak into one radio and read it on the other. Hold the button and talk.
-The Pi turns your speech into text **on the device**, shows it, and sends
-it over LoRa. The other radio shows it with the sender's name and signal
-strength, then sends back an ACK, and the first radio shows
-**Message delivered ✓**. No internet, no gateway, no cloud ASR.
+A chat between two radios. Hold the button and talk: the Pi turns your
+speech into text **on the device** and sends it over LoRa. The other radio
+shows it in the chat and sends back an ACK, and yours marks the message
+**✓**. Instead of talking, you can pick a quick reply with the button, or
+type on a keyboard plugged into the board. No internet, no gateway, no
+cloud ASR.
 
 Hardware per radio: a Raspberry Pi or Orange Pi Zero 2W, a **Whisplay HAT**
 (240×280 LCD, one button, RGB LED, microphone and speaker) and a
@@ -13,15 +14,40 @@ Hardware per radio: a Raspberry Pi or Orange Pi Zero 2W, a **Whisplay HAT**
 WalkieTalkie's radio driver, Whisplay daemon client, button handling and
 recorder, all proven on these HATs.
 
-<img src="docs/screen.png" width="240" alt="Screen: RX: OrangePi, the message, TX: Message delivered">
+<img src="docs/screen.png" width="240" alt="The chat: received messages on the left, sent on the right with a tick, and the button's hint at the bottom">
 
-```
-   hold          talk: recording → speech-to-text → LoRa
-   1 click       step back through the message history
-   2 clicks      resend the selected failed message, or back to live
-   3 clicks      read the selected message aloud (needs espeak-ng)
-   4 clicks      leave
-```
+### Using it
+
+The screen is a chat with the other radio. It shows the latest 10
+messages: received on the left (with the signal they came in at), sent on
+the right. Under each sent message is **✓** (delivered), *sending…* or
+**✗ not confirmed**. The bar at the bottom always says what the button
+does right now.
+
+**The button**
+
+| On the chat | |
+|---|---|
+| **hold** | talk; let go to send. On a radio without speech recognition, a hold opens the quick replies instead |
+| **2 clicks** | quick replies. On a failed message you have scrolled to: send it again |
+| **1 click** | scroll to an older message; past the oldest, back to the newest |
+| **3 clicks** | read the newest message aloud, or the one scrolled to (needs `espeak-ng`) |
+| **4 clicks** | leave |
+
+| In the quick replies | |
+|---|---|
+| **1 click** | next reply |
+| **hold** | send it |
+| **2 clicks** | back to the chat (it also closes by itself after 20 s) |
+
+The list starts with **↻ Resend** when your last message was not
+confirmed. The replies are set in `messaging.quick_replies`.
+
+**A keyboard** (USB or Bluetooth) plugged into the board: just type.
+**Enter** sends, **Esc** cancels, **Backspace** deletes, **↑/↓** scroll the
+chat (or move in the list), and **Tab** opens the quick replies. Keys only
+count while the Messenger has the screen. It is picked up within 2 s of
+plugging it in; see [controls/keys.py](controls/keys.py).
 
 ---
 
@@ -75,7 +101,7 @@ as START. WalkieTalkie frames on the same channel (`AA 55 …`) are ignored.
 | Situation | What happens |
 |---|---|
 | ACK arrives | **Delivered ✓**, with the round-trip time |
-| No ACK in `ack_timeout_seconds` (+ up to 0.5 s of random jitter) | sent again under the same ID, up to `max_retries` more times |
+| No ACK in `ack_timeout_seconds` + the round trip's UART and air time (0.9 s for a full message at 9600 bps, 1.4 s at 2400, 2.2 s at 1200) + up to 0.5 s of random jitter | sent again under the same ID, up to `max_retries` more times |
 | Still no ACK | **Not confirmed ✗**. Not "not delivered": if only the ACKs were lost, the message did arrive, and the sender cannot tell. Two clicks resend it. |
 | An ACK arrives after giving up | quietly marked delivered |
 | The receiver gets a repeat | it ACKs again but shows the message only once (duplicates are remembered for 10 minutes by sender and ID) |
@@ -126,8 +152,13 @@ These are inherited from WalkieTalkie; see its README for the full story.
    to manage from Linux, only the serial port and the M0/M1 mode pins.
 2. **M0/M1 share GPIO 22/27 with the LCD's backlight and DC lines.**
    Therefore:
-   - The app keeps the backlight at 100%. Dimming is 1 kHz PWM on M0 and
-     would deafen the radio.
+   - The app keeps the backlight at 100% and hands it back at 100% when it
+     leaves. Dimming is 1 kHz PWM on M0 and would deafen the radio, for
+     this app and for whatever uses the radio next. Another HAT app can
+     leave it dimmed, so `--headless`, which never touches the screen,
+     can find the radio deaf. The start-up log then says **THE RADIO IS
+     DEAF: module is in wake-on-radio tx mode**. Open the Messenger or
+     WalkieTalkie from the desktop once to put the backlight back to 100%.
    - The Whisplay driver must park DC (the radio's M1) low after each
      frame: [docs/whisplay-dc-fix.patch](docs/whisplay-dc-fix.patch),
      applied by `setup.sh`.
@@ -135,14 +166,33 @@ These are inherited from WalkieTalkie; see its README for the full story.
      the radio deaf for about 11 ms.
    - Moving M0/M1 to free GPIOs and setting `radio.mode_pins` removes all
      three constraints.
-3. **The module is provisioned once.** `provision_radio.py` writes the
-   frequency and air rate to non-volatile memory. A module already
-   provisioned for WalkieTalkie needs nothing more, because the settings
-   are identical.
+3. **The module is provisioned once, and both apps share it.**
+   `provision_radio.py` writes the frequency and air rate to non-volatile
+   memory. On a board that also has WalkieTalkie, use **its**
+   `provision_radio.py --range normal|long|longest`. It runs on both
+   boards and records what it wrote in `../WalkieTalkie/config.yaml`.
+   The Messenger's `radio.frequency_mhz` and `radio.air_speed` default to
+   `auto`, which reads them from that file. So after `--range long`, the
+   Messenger counts airtime and waits for ACKs at 2400 bps without being
+   told. This project's `provision_radio.py` refuses to write different
+   settings there, because WalkieTalkie would go on believing the old ones.
 4. **One app per radio.** WalkieTalkie and the Messenger both use
-   `/dev/ttyS0`. If both run, each steals the other's bytes. The app
-   detects this and shows **LoRa port shared**. Quit one before starting
-   the other.
+   `/dev/ttyS0`. If both have it open, each steals the other's bytes, and
+   messages arrive broken on both sides. This can happen because the HAT
+   desktop starts an app without stopping the one before, and
+   WalkieTalkie keeps its radio when it loses the screen, so it can keep
+   listening. An app started over SSH or at boot also counts. Both apps
+   therefore lock the port when they open it (`exclusive=True`, an
+   `flock`). The second one is refused, and its screen says **Radio busy:
+   quit WalkieTalkie** (WalkieTalkie says *radio busy: quit Messenger*).
+   Quit the named app and open this one again. The name comes from the
+   holder's folder. It is only visible when both run with the same
+   credentials, as they do from the HAT desktop; otherwise the screen
+   says "quit another app".
+5. **Both radios must run the same app.** The two apps' packets ignore
+   each other (Messenger frames start `AA 01`–`05`, WalkieTalkie's
+   `AA 55`). A message sent to a radio that is in WalkieTalkie ends as
+   **Not confirmed**.
 
 ---
 
@@ -160,7 +210,8 @@ accepts everything, `--asr` overrides the engine choice). It:
 
 1. installs the apt packages (`python3-serial python3-yaml python3-pil
    python3-numpy python3-venv alsa-utils`, plus `espeak-ng`, which is
-   optional and only used for reading aloud)
+   optional and only used for reading aloud). Without sudo, a board with
+   the system pip can do without `python3-venv`.
 2. creates `.venv` and installs the ASR engine from wheels only, then
    fetches its model
 3. checks the serial port for a kernel console and for other programs
@@ -191,7 +242,7 @@ curl -LO https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
 rsync -a --partial wheels/vosk-* wheels/srt-* wheels/websockets-* model.tar.zst jarvis@PI:.cache/messager-wheels/
 
 # on the Pi
-cd ~/Messager && mkdir -p models && zstd -dc ~/.cache/messager-wheels/model.tar.zst | tar -C models -xf -
+cd ~/Messenger && mkdir -p models && zstd -dc ~/.cache/messager-wheels/model.tar.zst | tar -C models -xf -
 python3 -m venv --system-site-packages .venv
 .venv/bin/pip install --no-index --find-links ~/.cache/messager-wheels vosk
 ./setup.sh --asr vosk        # now finds everything in place
@@ -232,10 +283,11 @@ MESSENGER_RADIO_PORT=/dev/pts/6 MESSENGER_IDENTITY_NAME=OrangePi \
 Type in either one. The apps will log `LoRa port shared`. That is the
 simulator holding the other end of the pty, and it is expected here.
 
-### Keyboard
+### Typing over SSH
 
 When stdin is a terminal (or `input.keyboard: on`), typed lines are sent
-as messages:
+as messages. This is for testing; a keyboard on the board is described
+under [Using it](#using-it).
 
 ```
 any text   send it           /talk      record; Enter stops and sends
@@ -252,11 +304,15 @@ Everything is in [config.yaml](config.yaml), with defaults in
 
 | Setting | Default | Meaning |
 |---|---|---|
+| `radio.frequency_mhz` / `radio.air_speed` | `auto` | what the module holds. "auto" reads WalkieTalkie's `config.yaml` next to this folder (the module is shared; see [Hardware facts](#hardware-facts-that-shape-the-build) 3), else 868 / 9600. Used for the duty-cycle budget, ACK waits and the channel byte |
 | `radio.address` | `auto` | 0–65534. "auto" derives it from the hostname, so two boards with different hostnames need no setup |
 | `radio.peer_address` | 65535 | who spoken messages go to. 65535 means everyone; the radio that hears it ACKs |
 | `identity.name` | `auto` | shown on the other radio as "RX: name". "auto" uses the hostname |
 | `messaging.ack_timeout_seconds` / `max_retries` | 3.0 / 3 | per attempt / resends after the first |
 | `asr.engine` / `asr.model` | `auto` / `tiny.en` | see [Speech recognition](#speech-recognition) |
+| `messaging.quick_replies` | OK, Yes, No, On my way, Where are you?, Call me, Wait 5 minutes, Thank you | the button's canned messages. Quote them: YAML reads a bare Yes/No as true/false |
+| `ui.chat_messages` | 10 | how many of the latest messages the chat shows |
+| `input.physical_keyboard` | true | read a keyboard plugged into the board |
 | `tts.enabled` | false | read received messages aloud |
 | `audio.mic_level` | 80 | 100 overdrives the Whisplay preamp, and distorted audio transcribes badly |
 
@@ -274,12 +330,174 @@ lora/                sx126x.py (E22 UART driver) · packet.py (format, CRC, defr
                      protocol.py (IDs, dedupe, splitting) · link.py (rx thread, tx + duty cycle)
                      airtime.py · modepins.py (is the radio deaf?)
 audio/               recorder.py (pre-roll PTT) · player.py (cues, TTS) · dsp.py · devices.py
-display/             board.py (Whisplay daemon client) · whisplay.py (layout, frames, backlight)
-controls/            button.py (hold/click gestures) · keyboard.py
+display/             board.py (Whisplay daemon client) · whisplay.py (the chat, frames, backlight)
+controls/            button.py (hold/click gestures) · keys.py (a keyboard on the board)
+                     keyboard.py (typing over SSH)
 messaging/           sender.py (ACK/retry) · receiver.py · history.py
 tools/               sim_air.py · linktest.py · launch_via_daemon.py
-tests/               89 tests; fakes.py models the E22 module
+tests/               131 tests; fakes.py models the E22 module
 ```
+
+---
+
+## Update 2026-09-29 (later): a chat, quick replies and a keyboard
+
+#### Update summary
+- The Orange Pi could receive but not answer: it had no speech
+  recognition, and without it the button could not send anything. Now it
+  has faster-whisper, installed without sudo. And any radio can answer
+  without speaking, with quick replies on the button or a keyboard.
+- The screen is a chat: the latest 10 messages, received on the left and
+  sent on the right, each with its time and its delivery or signal. The
+  bottom bar always says what the button does. See [Using it](#using-it).
+
+#### What changed
+- [display/whisplay.py](display/whisplay.py): the chat view (`Bubble`,
+  `Picker`, `View`) and its renderer. The newest message sits at the
+  bottom and older ones scroll off the top. Also a typing line, the quick
+  reply list, and a "▼ n newer" badge while scrolled back. A long radio
+  name steps down a font size before it is cut.
+- [main.py](main.py): gestures depend on what is open (the chat or the
+  quick replies). A hold without speech recognition opens the replies.
+  The reply list offers **↻ Resend** after a failed message and closes
+  after 20 s. 2 clicks on a scrolled-to failed message resends it.
+- [controls/keys.py](controls/keys.py): reads keyboards from
+  `/dev/input` alongside the Whisplay daemon, which never passes keys to
+  other apps. It ignores the Orange Pi's power button, ADC buttons and IR
+  receiver, and picks up a keyboard plugged in later. `install.sh`
+  registers with `disable_esc_exit_key`, so Esc cancels typing instead of
+  quitting.
+- `setup.sh` installs speech recognition without sudo. With no
+  `python3-venv`, it makes the venv `--without-pip` and fills it with the
+  system pip, after first installing a current pip into it: Ubuntu
+  22.04's pip 22.0.2 crashes resolving faster-whisper. It asks for
+  `pytest>=7`, because faster-whisper brings `anyio`, whose pytest plugin
+  breaks the older system pytest.
+- Fixed a race in [messaging/sender.py](messaging/sender.py). An ACK that
+  arrived just as the last retry ran out was taken for the in-flight
+  message and dropped, so a message that had arrived stayed "not
+  confirmed". It made `test_late_ack_still_marks_delivered` fail now and
+  then.
+- Config: `messaging.quick_replies`, `ui.chat_messages`,
+  `input.physical_keyboard`.
+
+#### Validation
+- `python3 -m pytest tests -q`: **131 passed** on the development
+  machine, the Orange Pi and the Pi Zero.
+  - New: `test_chat.py` (14: the 10 shown, left and right, titles,
+    delivery marks, hints, quick replies by hold and click, resend from
+    the list, typing, Esc, arrows, no keys without the screen) and
+    `test_keys.py` (6: which devices are keyboards, shift, caps lock,
+    repeat, events split across reads, a keyboard read through a real
+    FIFO and then unplugged).
+  - Also new: display tests for the layout (left and right by pixel
+    colour, the newest lowest, overflow off the top, the long-name
+    header) and the sender race. The race test fails without the fix.
+- Orange Pi: `./setup.sh` installed faster-whisper and tiny.en without
+  sudo. `./run.sh --transcribe jfk.wav` gave the sentence word for word,
+  loading in 2.9 s and transcribing 11 s of audio in 5.9 s.
+- On the radios, both running the new version from the HAT desktop: a
+  hold on the Orange Pi was heard as "Hello, 1, 2, 3." in 4.4 s, and
+  delivered to the Pi Zero in 658 ms. Both screens were captured from
+  the daemon's framebuffer and checked. Each showed the chat with the
+  message on the correct side and a ✓ on the sender's.
+
+#### Notes
+- **The two boards' clocks show different timezones.** The Orange Pi
+  shows UTC and the Pi Zero British time, so the times in the chat
+  disagree. On each, run `sudo timedatectl set-timezone Australia/…`
+  with your city.
+- **The keyboard was not tried with a real keyboard.** Neither board had
+  one plugged in. The reading and decoding were tested through a FIFO
+  with real input-event bytes.
+- The quick-reply gestures were tested in software. A hold on the
+  Orange Pi, the path that used to fail, was tried on the real button.
+- The Pi Zero's Vosk small model mishears a good deal ("Lou adler do").
+  Whisper on its 415 MB would swap. A larger Vosk model is the likely
+  next step, if its memory allows.
+
+---
+
+## Update 2026-09-29: sharing a board with WalkieTalkie
+
+#### Update summary
+- The Messenger now runs on the same radios as WalkieTalkie without the
+  two getting in each other's way. The first messages over the air went
+  both ways between the Orange Pi Zero 2W and the Pi Zero 2 W.
+
+#### What changed
+- **The radio port is locked** (`lora/sx126x.py`: `exclusive=True`,
+  `PortBusy`, `port_users`). WalkieTalkie got the same change. Before,
+  a second app on `/dev/ttyS0` only logged a warning and went on
+  sharing the port. See [Hardware facts](#hardware-facts-that-shape-the-build) 4.
+- **The frequency and air rate follow WalkieTalkie** (`auto`,
+  `config.module_settings`). Both radios had been moved to 2400 bps with
+  WalkieTalkie's `--range long` while the Messenger still said 9600. That
+  undercounted airtime four times over against the 1% duty cycle.
+  `setup.sh` step 6 now shows the values in use and offers to switch a
+  mismatched `config.yaml` to `auto`.
+- **ACK waits include the round trip's air time** (`Link.round_trip_seconds`).
+  A fixed 3 s left 1.6 s of slack at 2400 bps and under 1 s at 1200, so
+  a message whose ACK was already on its way could be sent again.
+- **Leaving hands the backlight back at 100%**, not at `ui.brightness`
+  (80). At 80, M0 was high a fifth of the time, which deafened a
+  WalkieTalkie still running in the background.
+- **`provision_radio.py` refuses** to write a frequency or air rate other
+  than the one WalkieTalkie recorded.
+- **`run.sh` runs `.venv/bin/python`** instead of sourcing
+  `.venv/bin/activate`. The Pi Zero's venv had been made as
+  `/home/mengpi/Messager/.venv`, so after the rename `activate` quietly
+  fell back to the system Python. Vosk then "could not load", although
+  `setup.sh --check` (which uses `.venv/bin/python`) said it was
+  installed.
+- `setup.sh --check` now fails on a missing Vosk model instead of
+  skipping it silently.
+- The deaf-radio log names the state that deafens the radio. It used to
+  say "transparent mode (16% of the time)" for a radio that was
+  transparent 84% of the time.
+- `deploy.sh` defaults to `~/Messenger` (it was `~/Messager`), and the
+  README's offline install uses the new folder name too.
+
+#### Validation
+- `python3 -m pytest tests -q`: **105 passed** on the development
+  machine (a Jetson), the Orange Pi Zero 2W and the Pi Zero 2 W. The new
+  tests are in `tests/test_sharing.py` and cover:
+  - a second opener refused until the first closes;
+  - the holder named by its folder, from a real child process holding a
+    pty;
+  - the app's "Radio busy: quit WalkieTalkie";
+  - `auto` from WalkieTalkie's file, with its defaults, and without it;
+  - numbers and the environment still winning over `auto`;
+  - the provisioning refusal.
+- Also new: the ACK-wait tests in `test_messaging.py`, the backlight
+  hand-back and PWM-deafness tests in `test_display.py`, and a `run.sh`
+  test with a stale `activate`. Each new test failed with its fix
+  undone.
+- On the radios (both at 868 MHz and 2400 bps, set by WalkieTalkie):
+  - The Orange Pi typed (`--headless`) to the Pi Zero, which was running
+    from the daemon: **delivered on the first try, ACK in 712 ms**. Then
+    the reverse: **708 ms**. Both learned the other's name from the
+    HELLOs.
+  - While the Messenger held the Pi Zero's port, WalkieTalkie's driver
+    was refused with `/dev/ttyS0 is in use by Messenger`.
+  - After the Messenger quit, M0/M1 read transparent 4000 times out of
+    4000 samples. Before, with the backlight left at about 76%, only 3032
+    were transparent, and a headless test heard nothing.
+  - `./setup.sh --check`: **Ready** on the Pi Zero. On the Orange Pi, one
+    fail: `python3-venv` is missing.
+
+#### Notes
+- **Orange Pi: speech recognition still needs installing.** It needs
+  sudo: `sudo apt install python3-venv` (and `espeak-ng` for read-aloud),
+  then `cd ~/Messenger && ./setup.sh`, which picks faster-whisper for its
+  981 MB. Until then, the Messenger there receives and ACKs, but cannot
+  turn speech into text.
+- The Pi Zero's Vosk model was missing. It was copied over from the
+  development machine into `~/Messenger/models`, and `config.yaml`
+  points at it.
+- The Whisplay daemon refuses to launch an app while another has the
+  screen. So a clash needs one app running without it: WalkieTalkie
+  after losing focus, or anything started over SSH or at boot.
 
 ---
 
@@ -348,9 +566,8 @@ tests/               89 tests; fakes.py models the E22 module
 
 ## Notes
 
-- **Not yet run end to end over the air.** Launching the app sends a
-  HELLO. The next checks need a second radio: `linktest hello`, then
-  `linktest ping`, then the app on both boards.
+- ~~Not yet run end to end over the air.~~ Done on 2026-09-29; see the
+  update above.
 - **The silence gate does nothing on this microphone.** The Zero 2 W's
   filtered room noise measured 620–900 RMS against a threshold of 120,
   so only a dead microphone is caught. Vosk still returns nothing for

@@ -5,7 +5,13 @@ Run this once per radio, before the app is used, and then not again.
 Every module gets the same frequency and air rate. The address written
 here does not matter: the app puts SRC/DST in its own packet header
 (lora/packet.py). A module already provisioned for WalkieTalkie needs
-nothing more -- the two apps use identical module settings.
+nothing more: the messenger reads the frequency and air rate from
+WalkieTalkie's config.yaml (`auto` in config.yaml).
+
+**On a board that also has WalkieTalkie**, provision with its
+provision_radio.py (`--range normal|long|longest`), which runs on both
+boards and records what it wrote. This tool refuses to write anything
+different there: WalkieTalkie would go on believing the old settings.
 
 **Why it is separate from the app.** Setting the module's frequency,
 address and air rate requires driving M0/M1 -- GPIO 22 and 27 -- into
@@ -111,6 +117,19 @@ def main() -> int:
     parser.add_argument("--force", action="store_true",
                         help="proceed even if the mode pins look busy")
     args = parser.parse_args()
+
+    walkie = config_module.module_settings()
+    wanted = {"frequency_mhz": args.frequency, "air_speed": args.air_speed}
+    if walkie and walkie != wanted and not args.check:
+        where = config_module.WALKIE_CONFIG
+        print(f"! WalkieTalkie provisioned this module for {walkie['frequency_mhz']} MHz "
+              f"at {walkie['air_speed']} bps ({where}).", file=sys.stderr)
+        print("  Both apps share the module, so change it with WalkieTalkie's tool; the",
+              file=sys.stderr)
+        print("  messenger follows it (radio.air_speed: auto):", file=sys.stderr)
+        print(f"    cd {where.parent} && sudo python3 provision_radio.py "
+              "--range normal|long|longest", file=sys.stderr)
+        return 2
 
     missing = mode_pin_driver_missing()
     if missing:
