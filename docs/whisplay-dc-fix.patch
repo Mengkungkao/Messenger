@@ -1,0 +1,52 @@
+Park DC low after each transfer, so it stops muting the LoRa module
+
+DC_PIN is BOARD 13 (BCM 27 on a Pi, PH3 on an Orange Pi Zero 2W), which
+the Waveshare SX1262 HAT uses as the module's M1. _send_data and
+_send_data_bytes raise DC and never lower it, so after any frame flush
+the line rests high and the module sits in configuration mode: it
+accepts every byte over the UART, answers each write with FF FF FF,
+radiates none of them, and hears nothing.
+
+Lowering DC at the end of each data transfer costs one GPIO write and is
+invisible to the display, which only samples DC while SPI is clocking.
+
+Apply from the root of the Whisplay checkout, then restart the daemon:
+
+    git apply ~/WalkieTalkie/docs/whisplay-dc-fix.patch
+    sudo systemctl restart whisplay-daemon
+
+The installers check for this and apply it themselves.
+
+diff --git a/runtime/whisplay.py b/runtime/whisplay.py
+index 5df66af..42fdc06 100644
+--- a/runtime/whisplay.py
++++ b/runtime/whisplay.py
+@@ -522,6 +522,7 @@ class WhisplayBoard:
+         if args:
+             self._gpio_output(self.DC_PIN, 1)
+             self._send_data(list(args))
++            self._gpio_output(self.DC_PIN, 0)
+ 
+     def _send_data(self, data):
+         self._gpio_output(self.DC_PIN, 1)
+@@ -531,6 +532,11 @@ class WhisplayBoard:
+             max_chunk = 4096
+             for i in range(0, len(data), max_chunk):
+                 self.spi.writebytes(data[i : i + max_chunk])
++        # Leave DC low. The display only samples it while SPI is clocking,
++        # so it cannot tell -- but on a stacked SX1262 LoRa HAT this line
++        # is the module's M1, and leaving it high parks the radio in
++        # configuration mode, where it can neither send nor hear.
++        self._gpio_output(self.DC_PIN, 0)
+ 
+     def _send_data_bytes(self, data: bytes | bytearray):
+         """Fast path for bytes/bytearray — avoids Python list overhead."""
+@@ -541,6 +547,8 @@ class WhisplayBoard:
+             max_chunk = 4096
+             for i in range(0, len(data), max_chunk):
+                 self.spi.writebytes(list(data[i : i + max_chunk]))
++        # See _send_data: DC doubles as the LoRa module's M1.
++        self._gpio_output(self.DC_PIN, 0)
+ 
+     def set_window(self, x0, y0, x1, y1, use_horizontal=0):
+         if use_horizontal in (0, 1):

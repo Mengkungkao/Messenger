@@ -1,0 +1,71 @@
+# LoRa Messenger configuration.
+#
+# Every value has a working default in config.py, so an empty file still
+# runs. Environment variables win over this file:
+#   MESSENGER_RADIO_PORT=/dev/pts/5 MESSENGER_IDENTITY_NAME=Rover ./run.sh
+
+radio:
+  port: /dev/ttyS0
+  uart_baud: 9600
+  # Written into the module by provision_radio.py; must match on both radios.
+  frequency_mhz: 868
+  air_speed: 9600
+  power_dbm: 22
+  # This radio's address, 0-65534. "auto" derives it from the hostname,
+  # so a Raspberry Pi and an Orange Pi with different hostnames need no
+  # configuring at all.
+  address: auto
+  # Who spoken messages go to. 65535 = every radio in range; the one
+  # that hears it sends the ACK. Put the other radio's address here to
+  # talk to it alone when more radios share the channel.
+  peer_address: 65535
+  # EU 868: 1% duty cycle, enforced. 100 only where you are licensed.
+  duty_cycle_percent: 1.0
+  # Leave null with the stock M0/M1 jumpers (GPIO 22/27 belong to the
+  # Whisplay LCD). [m0, m1] only after rewiring M0/M1 to free GPIOs.
+  mode_pins: null
+  # Where M0/M1 physically are, whether or not we drive them.
+  wired_mode_pins: [22, 27]
+
+identity:
+  # Shown on the other radio as "RX: <name>". "auto" = hostname.
+  name: auto
+
+messaging:
+  ack_timeout_seconds: 3.0
+  max_retries: 3
+  history_size: 200
+
+audio:
+  capture_device: auto        # or e.g. plughw:2 for a USB microphone
+  playback_device: auto
+  preferred_card: whisplay
+  mic_level: 80               # 100 overdrives the Whisplay preamp
+  max_record_seconds: 15
+
+asr:
+  # auto | faster-whisper | vosk | whisper-cpp | none
+  engine: auto
+  # faster-whisper: tiny.en, base.en, ... (downloaded on first use)
+  # vosk: path to an unpacked model directory
+  # whisper-cpp: path to a ggml .bin model
+  model: tiny.en
+  language: en
+  threads: 0                  # 0 = up to 4
+
+tts:
+  enabled: false              # read received messages aloud (espeak-ng)
+  voice: en
+  words_per_minute: 150
+
+ui:
+  brightness: 80
+  idle_dim_seconds: 30
+  idle_dim_brightness: 15
+  idle_off_seconds: 0
+
+input:
+  debounce_ms: 75
+  click_window_ms: 700
+  hold_ms: 350
+  keyboard: auto              # type messages on stdin when it is a terminal

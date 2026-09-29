@@ -1,0 +1,15 @@
+# Runtime dependencies. On Raspberry Pi OS / Orange Pi OS the first four
+# come from apt (python3-serial python3-yaml python3-pil python3-numpy);
+# setup.sh installs the ASR engine into .venv.
+pyserial>=3.5
+PyYAML>=6.0
+Pillow>=9.0
+numpy>=1.21
+
+# Speech recognition: one of these. faster-whisper is the default;
+# vosk is lighter, for a 512 MB Pi Zero 2 W.
+faster-whisper>=1.0
+# vosk>=0.3.45
+
+# Tests
+pytest>=7
