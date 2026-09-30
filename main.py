@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """LoRa Messenger: a chat between radios, spoken, picked or typed.
 
-On the chat:
-    hold the button   talk; on release, speech -> text -> LoRa
-                      (no speech recognition here: opens the quick replies)
-    1 click           scroll to older messages; past the oldest, back to now
+The controls are MFruit OS's (mfruit_sdk.input: the button and any USB or
+Bluetooth keyboard). The chat is a talk screen:
+
+    hold / Space held talk; on release, speech -> text -> LoRa
+                      (no speech recognition here: a hold opens the replies)
+    tap               scroll to older messages; past the oldest, back to now
     2 clicks          quick replies -- or resend, on a failed message
     3 clicks          read the newest (or scrolled-to) message aloud
-    4 clicks          leave
+    4 clicks / Esc    leave the app
+    letters, Enter    type a message and send it; Esc cancels it
+    Up / Down         older / newer; Tab or Enter opens the quick replies
 
-In the quick replies:
-    1 click           next reply
-    hold              send it
-    2 clicks          back to the chat
+The quick replies are a list, as everywhere in MFruit OS:
 
-A keyboard plugged into the board: type, Enter sends, Esc cancels,
-Up/Down scroll, Tab opens the quick replies (controls/keys.py).
+    tap / Down        next reply            2 clicks / Up   previous
+    hold / Enter      send it               4 clicks / Esc  back to the chat
 
     python3 main.py                      run (./run.sh does this)
     python3 main.py --headless           no screen: keyboard and log only
@@ -42,9 +43,11 @@ from asr.speech_to_text import NoEngine, create_engine, read_wav
 from audio import devices
 from audio.player import Player
 from audio.recorder import Recorder
-from controls.button import DOUBLE, QUAD, SINGLE, TRIPLE, GestureDetector
+from mfruit_sdk.input import (BACK, BUTTON, CHAR, ERASE, EXTRA, KEYBOARD, NEXT,
+                              PREVIOUS, SELECT, TALK_END, TALK_START, InputController)
+from mfruit_sdk.status import StatusMonitor
+
 from controls.keyboard import HELP, Keyboard
-from controls.keys import KeyReader
 from display import board as board_module
 from display.whisplay import Bubble, Picker, Screen, View, render
 from lora import modepins, protocol
@@ -66,8 +69,12 @@ PICKER_SECONDS = 20.0
 # Longer than anyone types into one message; split_text handles the rest.
 MAX_COMPOSE = 600
 
-HINT_TALK = "Hold: talk · 2×: replies"
-HINT_NO_ASR = "Hold or 2×: quick reply"
+# Footer hints: (gesture, what it does), most important first -- the
+# footer drops what does not fit from the end.
+HINTS_TALK = [("hold", "talk"), ("2×", "replies"), ("4×", "exit")]
+HINTS_NO_ASR = [("hold", "replies"), ("tap", "older"), ("4×", "exit")]
+HINTS_PICKER = [("tap", "next"), ("hold", "send"), ("4×", "back")]
+HINTS_TYPING = [("Enter", "send"), ("Esc", "cancel")]
 
 
 class Messenger:
@@ -106,15 +113,28 @@ class Messenger:
             mode = "given"
         self.board, self.board_mode = board, mode
         self.screen = Screen(board, config.ui)
-        self.gestures = GestureDetector(
-            on_gesture=self._on_gesture, on_hold_start=self._on_talk_start,
-            on_hold_end=self._on_talk_end, debounce_ms=config.input.debounce_ms,
-            click_window_ms=config.input.click_window_ms, hold_ms=config.input.hold_ms)
-        self.gestures.attach(board)
+        # The button and a USB / Bluetooth keyboard, as MFruit OS actions.
+        # The chat is a talk screen (hold or Space talks) while the reply
+        # list is closed and there is speech recognition to talk to.
+        self.armed = False
+        self.input = InputController(
+            self._on_action,
+            talk=lambda: self.picker is None and self.can_talk,
+            typing=lambda: self.compose is not None,
+            active=self._has_screen,
+            on_armed=self._on_armed,
+            debounce_ms=config.input.debounce_ms,
+            click_window_ms=config.input.click_window_ms,
+            long_press_ms=config.input.long_press_ms,
+            talk_press_ms=config.input.hold_ms,
+            keyboard=config.input.physical_keyboard)
+        self.input.attach(board)
         for hook, handler in (("on_exit_request", lambda *_: self.stop("daemon")),
-                              ("on_focus_revoked", lambda *_: log.info("screen taken"))):
+                              ("on_focus_revoked", self._on_focus_revoked)):
             if hasattr(board, hook):
                 getattr(board, hook)(handler)
+        # WiFi and battery for the MFruit OS status bar.
+        self.status = StatusMonitor(interval=15.0, on_change=lambda _s: self._wake.set())
 
         # --- radio -----------------------------------------------------
         self.radio = radio if radio is not None else self._open_radio()
@@ -144,9 +164,6 @@ class Messenger:
         self.keyboard = None
         if Keyboard.wanted(config.input.keyboard):
             self.keyboard = Keyboard(self._on_typed, self._on_command)
-        self.keys = None
-        if config.input.physical_keyboard:
-            self.keys = KeyReader(self._on_char, self._on_key)
 
     # ================================================================ radio
     def _open_radio(self):
@@ -225,10 +242,8 @@ class Messenger:
     def _on_talk_start(self):
         with self._lock:
             if self.picker is not None:
-                # Hold in the reply list sends the highlighted reply. On the
-                # press, not the release: the release of the hold that
-                # opened the list must not send anything.
-                self._send_picked()
+                # The reply list is not a talk screen: there a hold picks the
+                # reply, on release (the input controller never talks there).
                 return
             if self.listening or self.transcribing:
                 return
@@ -371,23 +386,55 @@ class Messenger:
             self.send(text)
         self._wake.set()
 
-    # ============================================================ gestures
-    def _on_gesture(self, gesture: str):
+    # =============================================================== input
+    def _on_armed(self, armed: bool):
+        """A hold passed the threshold in the reply list: say what release does."""
+        self.armed = armed
+        self._wake.set()
+
+    def _on_focus_revoked(self, *_args):
+        # The screen is someone else's now, and so is the keyboard.
+        log.info("screen taken")
+        self.input.reset()
+
+    def _on_action(self, action):
+        """One MFruit OS input action, from the button or a keyboard."""
+        if action.name == TALK_START:
+            self._on_talk_start()
+            return
+        if action.name == TALK_END:
+            self._on_talk_end(action.held)
+            return
         dark = not self.screen.awake
         self.screen.poke()
-        if dark and gesture != QUAD:
+        if dark and action.source == BUTTON and action.name != BACK:
             self._wake.set()
             return      # a click on a dark screen only wakes it
-        if gesture == QUAD:
-            self.stop("four clicks")
-        elif self.picker is not None:
-            if gesture == SINGLE:
-                self._move_picker(+1)
-            elif gesture == DOUBLE:
+        if action.source == KEYBOARD:
+            self._on_key(action)
+        else:
+            self._on_button(action.name)
+        self._wake.set()
+
+    def _on_button(self, name: str):
+        with self._lock:
+            picking, composing = self.picker is not None, self.compose is not None
+        if picking:
+            if name in (NEXT, PREVIOUS):
+                self._move_picker(+1 if name == NEXT else -1)
+            elif name == SELECT:
+                self._send_picked()
+            elif name == BACK:
                 self.close_picker()
-        elif gesture == SINGLE:
+        elif name == BACK:
+            if composing:
+                with self._lock:
+                    self.compose = None     # four clicks go back: first out of typing
+            else:
+                self.stop("four clicks")
+        elif name == NEXT:
             self._scroll(+1)
-        elif gesture == DOUBLE:
+        elif name == PREVIOUS:
             selected = self.selected()
             if (selected and selected.direction == h.TX and selected.status == h.FAILED
                     and self.sender and self.sender.resend(selected)):
@@ -396,60 +443,71 @@ class Messenger:
                     self.scroll = 0
             else:
                 self.open_picker()
-        elif gesture == TRIPLE:
-            chosen = self.selected() or next(
-                (m for m in reversed(self.chat()) if m.direction == h.RX), None)
-            if not self.player.can_speak:
-                self.flash("No text-to-speech (espeak-ng)", "error")
-            elif chosen:
-                self.player.speak(chosen.text)
-        self._wake.set()
+        elif name == EXTRA:
+            self._read_aloud()
+        elif name == SELECT:
+            # A hold where there is no voice to talk with: pick a reply.
+            self.open_picker()
+            if not self.can_talk:
+                self.flash("No voice here: pick one", "busy", 2.5)
+
+    def _read_aloud(self):
+        chosen = self.selected() or next(
+            (m for m in reversed(self.chat()) if m.direction == h.RX), None)
+        if not self.player.can_speak:
+            self.flash("No text-to-speech (espeak-ng)", "error")
+        elif chosen:
+            self.player.speak(chosen.text)
 
     # ================================================ a keyboard on the board
     def _has_screen(self) -> bool:
         # In the background the keys belong to whatever has the screen.
-        return getattr(self.board, "foreground_ready", True)
+        return bool(getattr(self.board, "foreground_ready", True))
 
     def _on_char(self, char: str):
-        if not self._has_screen():
-            return
         with self._lock:
             self.picker = None
             text = (self.compose or "") + char
             if text.strip() or self.compose is not None:
                 self.compose = text[:MAX_COMPOSE]
-        self.screen.poke()
-        self._wake.set()
 
-    def _on_key(self, key: str):
-        if not self._has_screen():
-            return
-        self.screen.poke()
+    def _on_key(self, action):
         with self._lock:
             composing, picking = self.compose is not None, self.picker is not None
-        if key == "enter":
+        name = action.name
+        if name == CHAR:
+            self._on_char(action.char)
+        elif name == ERASE:
+            if composing:
+                with self._lock:
+                    self.compose = self.compose[:-1] or None
+        elif name == SELECT:
             if composing:
                 with self._lock:
                     text, self.compose = self.compose, None
                 self.send(text)
             elif picking:
                 self._send_picked()
-        elif key == "escape":
-            with self._lock:
-                self.compose = None
-                self.picker = None
-        elif key == "backspace" and composing:
-            with self._lock:
-                self.compose = self.compose[:-1] or None
-        elif key in ("up", "down"):
-            step = -1 if key == "up" else +1
-            if picking:
-                self._move_picker(step)
             else:
-                self._scroll(-step, wrap=False)
-        elif key == "tab" and not composing:
-            self.open_picker()
-        self._wake.set()
+                self.open_picker()
+        elif name == BACK:
+            if composing:
+                with self._lock:
+                    self.compose = None
+            elif picking:
+                self.close_picker()
+            else:
+                self.stop("Esc")
+        elif name in (NEXT, PREVIOUS):
+            if picking:
+                self._move_picker(+1 if name == NEXT else -1)
+            elif action.key == "tab":
+                if not composing:
+                    self.open_picker()
+            else:
+                # The chat reads top to bottom, oldest first: Up is older.
+                older = action.key in ("up", "left")
+                self._scroll(+1 if older else -1, wrap=False)
 
     # ====================================================== stdin (SSH)
     def _on_typed(self, text: str):
@@ -504,32 +562,39 @@ class Messenger:
             return self.history.name_for(peers[0])
         if peers:
             return f"{len(peers)} radios"
-        return "LoRa Messenger"
+        return "Messenger"
 
     def _status(self) -> tuple:
+        """A state worth showing instead of the hints, or ("", "idle")."""
         flash = self._flash
-        selected = self.selected()
         if self.listening:
             return f"Listening… {self.recorder.elapsed:.1f}s", "listen"
         if self.transcribing:
             return "Converting speech…", "busy"
         if flash and flash[2] > time.monotonic():
             return flash[0], flash[1]
-        if self.compose is not None:
-            return "Enter: send · Esc: cancel", "idle"
-        if self.picker is not None:
-            return "Click: next · Hold: send", "idle"
+        if self.compose is not None or self.picker is not None:
+            return "", "idle"
         if self._radio_note:
             return self._radio_note, "error"
         if self.sender is not None and self.sender.busy:
             return "Sending…", "busy"
-        if selected is not None:
-            if selected.direction == h.TX and selected.status == h.FAILED:
-                return "2×: resend · 1×: older", "idle"
-            return "1×: older · 3×: read aloud", "idle"
         if not self.asr.ready and not isinstance(self.asr, NoEngine) and not self.asr.error:
             return "Loading speech model…", "busy"
-        return (HINT_TALK if self.can_talk else HINT_NO_ASR), "idle"
+        return "", "idle"
+
+    def _hints(self) -> list:
+        """What the button (and Enter / Esc) do right now, for the footer."""
+        if self.compose is not None:
+            return HINTS_TYPING
+        if self.picker is not None:
+            return [("release", "to send")] if self.armed else HINTS_PICKER
+        selected = self.selected()
+        if selected is not None:
+            if selected.direction == h.TX and selected.status == h.FAILED:
+                return [("2×", "resend"), ("tap", "older"), ("4×", "exit")]
+            return [("3×", "read aloud"), ("tap", "older"), ("4×", "exit")]
+        return HINTS_TALK if self.can_talk else HINTS_NO_ASR
 
     def view(self) -> View:
         view = View()
@@ -546,15 +611,14 @@ class Messenger:
             view.picker = self.picker
             view.compose = self.compose
         view.title = self._title(chat)
-        if self.link and self.link.last_rssi:
-            view.signal = f"{self.link.last_rssi} dBm"
-        view.empty_hint = (["No messages yet", "Hold: talk", "2 clicks: quick reply"]
-                           if self.can_talk else
-                           ["No messages yet", "Hold or 2 clicks: quick reply"])
-        view.empty_hint += ["1 click: older · 3: read aloud", "4 clicks: leave"]
-        if self.keys and self.keys.connected:
-            view.empty_hint.append("or type, Enter sends")
+        view.empty_hint = (["No messages yet", "Hold to talk",
+                            "2 clicks: quick replies"] if self.can_talk else
+                           ["No messages yet", "Hold: quick replies"])
+        if self.input.keyboard_connected:
+            view.empty_hint.append("or type, and Enter sends")
         view.status, view.status_tone = self._status()
+        view.hints = self._hints()
+        view.device = self.status.sample()
         if self.listening:
             view.level = self.recorder.level
         return view
@@ -579,15 +643,14 @@ class Messenger:
         if self.link:
             self.link.start()
             self.sender.start()
-        self.gestures.start()
+        self.input.start()
+        self.status.start()
         if not isinstance(self.asr, NoEngine):
             self.asr.warm_up(on_done=self._wake.set)
         if self.keyboard:
             self.keyboard.start()
             print("Type a message and press Enter to send it. /help for commands.",
                   flush=True)
-        if self.keys:
-            self.keys.start()
         if self.sender:
             self.sender.send_hello()
         log.info("ready: %s #%04X, peer %s, board %s, ASR %s", self.name, self.address,
@@ -626,9 +689,8 @@ class Messenger:
 
     def _shutdown(self):
         self.recorder.close()
-        self.gestures.stop()
-        if self.keys:
-            self.keys.stop()
+        self.input.stop()
+        self.status.stop()
         if self.sender:
             self.sender.stop()
         if self.link:
@@ -694,8 +756,10 @@ def describe(message: h.Message, history: h.History) -> str:
 
 
 def sample_view() -> View:
+    from mfruit_sdk.status import Status
+
     return View(
-        title="OrangePi", signal="-63 dBm", status=HINT_TALK,
+        title="OrangePi", hints=HINTS_TALK, device=Status(3, 82, False),
         bubbles=[Bubble("Where are you?", False, "17:02 · -63 dBm"),
                  Bubble("On my way", True, "17:03 ✓", "ok"),
                  Bubble("Meet me at five o'clock", False, "17:04 · -64 dBm")])

@@ -28,6 +28,8 @@ import threading
 import time
 from pathlib import Path
 
+from mfruit_sdk.daemon import own_escape_key
+
 from utils.logger import get_logger
 
 log = get_logger("board")
@@ -245,6 +247,10 @@ def acquire_board(launch_command: str | None = None,
             return NullBoard(), "headless"
 
     proxy.register()
+    # Esc is this app's "back" (MFruit OS controls). Claimed now, before
+    # taking the screen: every registration makes the daemon redraw its
+    # desktop, which would flash over our first frame.
+    own_escape_key(APP_ID)
     proxy.start_event_listener()
     try:
         proxy.acquire_foreground(timeout_sec=2.0)

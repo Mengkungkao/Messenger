@@ -8,6 +8,7 @@ RSSI byte -- and everything above them is the production code.
 import time
 
 import pytest
+from mfruit_sdk.input import NEXT, PREVIOUS, Action
 
 import config as config_module
 from display.board import NullBoard
@@ -215,22 +216,23 @@ def test_scrolling_back_and_resending_a_failed_message(tmp_path, monkeypatch):
     assert [b.text for b in view.bubbles] == ["msg 0", "msg 1", "msg 2", "lost"]
     assert view.anchor is None and view.position == ""
     assert view.bubbles[-1].failed and "not confirmed" in view.bubbles[-1].meta
-    app._on_gesture("single")
+    tap = Action(NEXT)                                    # one click: older
+    app._on_action(tap)
     view = app.view()
     assert view.anchor == 2 and view.position == "3/4" and view.bubbles[2].selected
-    app._on_gesture("single")
-    app._on_gesture("single")
+    app._on_action(tap)
+    app._on_action(tap)
     assert app.selected().text == "msg 0"
-    app._on_gesture("single")
+    app._on_action(tap)
     assert app.scroll == 0 and app.selected() is None     # past the oldest: back to now
     # A reply arrives after the failed message; one click back selects it.
     app.history.add(h.Message(h.RX, 7, ORANGE, "after", h.RECEIVED))
-    app._on_gesture("single")
+    app._on_action(tap)
     assert app.selected() is failed
-    assert app.view().status == "2×: resend · 1×: older"
+    assert app.view().hints[0] == ("2×", "resend")
     app.sender.start()
     try:
-        app._on_gesture("double")
+        app._on_action(Action(PREVIOUS))                  # two clicks: resend
         assert app.scroll == 0 and app.picker is None
         assert wait_for(lambda: failed.status in (h.SENDING, h.FAILED) and failed.attempts)
     finally:

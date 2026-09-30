@@ -7,47 +7,62 @@ shows it in the chat and sends back an ACK, and yours marks the message
 type on a keyboard plugged into the board. No internet, no gateway, no
 cloud ASR.
 
+It is an **MFruit OS app**: MFruit OS's status bar, fonts, lists and
+footer hints, and the controls every MFruit app shares (the vendored MFruit
+App SDK in `mfruit_sdk/`), with a **USB or Bluetooth keyboard** working
+wherever the button does.
+
 Hardware per radio: a Raspberry Pi or Orange Pi Zero 2W, a **Whisplay HAT**
 (240×280 LCD, one button, RGB LED, microphone and speaker) and a
 **Waveshare SX126X LoRa HAT** (E22-900T22S). This is a sibling of
 [WalkieTalkie](../WalkieTalkie): it runs on the same hardware and reuses
-WalkieTalkie's radio driver, Whisplay daemon client, button handling and
-recorder, all proven on these HATs.
+WalkieTalkie's radio driver, Whisplay daemon client and recorder, all
+proven on these HATs.
 
-<img src="docs/screen.png" width="240" alt="The chat: received messages on the left, sent on the right with a tick, and the button's hint at the bottom">
+<img src="docs/screen.png" width="240" alt="The chat: the other radio's name, WiFi and battery at the top; received messages on the left, sent on the right with a tick; what the button does at the bottom">
 
 ### Using it
 
-The screen is a chat with the other radio. It shows the latest 10
-messages: received on the left (with the signal they came in at), sent on
-the right. Under each sent message is **✓** (delivered), *sending…* or
-**✗ not confirmed**. The bar at the bottom always says what the button
-does right now.
+The screen is a chat with the other radio, under MFruit OS's status bar
+(the other radio's name, WiFi, battery). It shows the latest 10 messages:
+received on the left (with the signal they came in at), sent on the
+right. Under each sent message is **✓** (delivered), *sending…* or
+**✗ not confirmed**. The footer always says what the button does right
+now; while something is happening (listening, sending, an error) a
+coloured bar says what instead.
 
-**The button**
+**On the chat** — a talk screen: holding talks.
 
-| On the chat | |
-|---|---|
-| **hold** | talk; let go to send. On a radio without speech recognition, a hold opens the quick replies instead |
-| **2 clicks** | quick replies. On a failed message you have scrolled to: send it again |
-| **1 click** | scroll to an older message; past the oldest, back to the newest |
-| **3 clicks** | read the newest message aloud, or the one scrolled to (needs `espeak-ng`) |
-| **4 clicks** | leave |
+| Button | Keyboard | |
+|---|---|---|
+| **hold** | **Space**, held | talk; let go to send. On a radio without speech recognition, a hold opens the quick replies instead |
+| **tap** | ↑ | scroll to an older message; past the oldest (button), back to the newest |
+| | ↓ | a newer message |
+| **2 clicks** | Tab, Enter | quick replies. On a failed message you have scrolled to (2 clicks): send it again |
+| **3 clicks** | | read the newest message aloud, or the one scrolled to (needs `espeak-ng`) |
+| **4 clicks** | Esc | leave the app |
+| | letters | type a message: **Enter** sends, **Esc** cancels, **Backspace** deletes; Space is a space once you are typing |
 
-| In the quick replies | |
-|---|---|
-| **1 click** | next reply |
-| **hold** | send it |
-| **2 clicks** | back to the chat (it also closes by itself after 20 s) |
+**In the quick replies** — a list, as everywhere in MFruit OS.
+
+| Button | Keyboard | |
+|---|---|---|
+| **tap** / **2 clicks** | ↓, Tab / ↑ | next / previous reply |
+| **hold**, then release | Enter | send it |
+| **4 clicks** | Esc | back to the chat (it also closes by itself after 20 s) |
+
+Talking starts 0.35 s into a hold (`input.hold_ms`), so the first word
+is kept; in the list a hold is MFruit OS's deliberate long press, 0.7 s
+(`input.long_press_ms`), and sends when you let go — the footer says
+**release to send** once it is armed.
 
 The list starts with **↻ Resend** when your last message was not
 confirmed. The replies are set in `messaging.quick_replies`.
 
-**A keyboard** (USB or Bluetooth) plugged into the board: just type.
-**Enter** sends, **Esc** cancels, **Backspace** deletes, **↑/↓** scroll the
-chat (or move in the list), and **Tab** opens the quick replies. Keys only
-count while the Messenger has the screen. It is picked up within 2 s of
-plugging it in; see [controls/keys.py](controls/keys.py).
+**A keyboard** (USB or Bluetooth) can be plugged in or paired at any
+time; it is picked up at once. Keys only count while the Messenger has
+the screen: typing into another app, while the Messenger keeps receiving
+in the background, never reaches it.
 
 ### Without Wi-Fi or internet
 
@@ -329,6 +344,7 @@ Everything is in [config.yaml](config.yaml), with defaults in
 | `asr.engine` / `asr.model` | `auto` / `tiny.en` | see [Speech recognition](#speech-recognition) |
 | `messaging.quick_replies` | OK, Yes, No, On my way, Where are you?, Call me, Wait 5 minutes, Thank you | the button's canned messages. Quote them: YAML reads a bare Yes/No as true/false |
 | `ui.chat_messages` | 10 | how many of the latest messages the chat shows |
+| `input.hold_ms` / `input.long_press_ms` | 350 / 700 | talking starts this far into a hold / a hold in the reply list sends after this (MFruit OS's long press) |
 | `input.physical_keyboard` | true | read a keyboard plugged into the board |
 | `tts.enabled` | false | read received messages aloud |
 | `audio.mic_level` | 80 | 100 overdrives the Whisplay preamp, and distorted audio transcribes badly |
@@ -340,20 +356,65 @@ message ID) and the single-instance lock.
 ## Project layout
 
 ```
-main.py              the app: state, gestures, keyboard, main loop, --transcribe/--preview
+main.py              the app: state, input actions, main loop, --transcribe/--preview
 config.py            config.yaml + environment → dataclasses
 asr/                 speech_to_text.py: engines, silence gate, clean-up
 lora/                sx126x.py (E22 UART driver) · packet.py (format, CRC, deframer)
                      protocol.py (IDs, dedupe, splitting) · link.py (rx thread, tx + duty cycle)
                      airtime.py · modepins.py (is the radio deaf?)
 audio/               recorder.py (pre-roll PTT) · player.py (cues, TTS) · dsp.py · devices.py
-display/             board.py (Whisplay daemon client) · whisplay.py (the chat, frames, backlight)
-controls/            button.py (hold/click gestures) · keys.py (a keyboard on the board)
-                     keyboard.py (typing over SSH)
+display/             board.py (Whisplay daemon client) · whisplay.py (the chat in MFruit OS's
+                     chrome, frames, backlight)
+controls/            keyboard.py (typing over SSH)
+mfruit_sdk/          MFruit App SDK, vendored: the input controller (button + USB/Bluetooth
+                     keyboard), status bar, lists, fonts. Do not edit here: change
+                     ~/MFruitOS/mfruitos/sdk, then ~/MFruitOS/scripts/sdk-sync.sh ~/Messenger
 messaging/           sender.py (ACK/retry) · receiver.py · history.py
-tools/               sim_air.py · linktest.py · launch_via_daemon.py
-tests/               133 tests; fakes.py models the E22 module
+tools/               sim_air.py · linktest.py · launch_via_daemon.py · preview.py (every
+                     screen to PNG)
+tests/               141 tests; fakes.py models the E22 module
 ```
+
+---
+
+## Update 2026-09-30: MFruit OS controls and look
+
+#### Update summary
+- The Messenger now handles and looks like every other MFruit OS app:
+  MFruit OS's status bar, fonts, colours, lists and footer hints, and the
+  shared input controller for the button and a USB or Bluetooth keyboard.
+
+#### What changed
+- Input goes through `mfruit_sdk.input.InputController` (replacing
+  `controls/button.py` and `controls/keys.py`). The chat is a talk screen:
+  hold or Space talks. The quick replies are an MFruit OS list: tap next,
+  2 clicks previous, hold (then release) sends, 4 clicks back — before,
+  2 clicks went back and the hold sent on the press.
+- 4 clicks (or Esc) on the chat leave the app; while typing they cancel
+  the typing first. Enter with nothing typed opens the quick replies.
+- A menu-style hold is MFruit OS's 0.7 s long press (`input.long_press_ms`);
+  talking still starts after 0.35 s (`input.hold_ms`).
+- Keyboards are found at once when plugged in (inotify), with no polling
+  while idle; the button worker makes no wakeups either.
+- The screen: MFruit OS's status bar with the other radio's name (shrunk
+  rather than cut when long), WiFi and battery; the footer shows the
+  hints, or a coloured bar while listening, sending or on an error; the
+  reply list is an MFruit OS list; only whole messages are drawn under the
+  status bar. The typing cursor is drawn (MFruit OS's font has no "▏").
+- Esc is claimed from the daemon at start-up (`own_escape_key`), as well as
+  by `install.sh`.
+
+#### Validation
+- `python3 -m pytest -q`: 141 pass. New `tests/test_controls.py` drives the
+  app's own controller with a fake clock (talk after 0.35 s, a deliberate
+  hold in the list that sends on release, 4 clicks leave, a click on a
+  dark screen only wakes it, nothing while another app has the screen).
+  `tests/test_chat.py` covers the keyboard through the controller (Space
+  talks, then types; Esc; arrows; Tab; keys pressed elsewhere ignored).
+- `python3 tools/preview.py` renders every state; checked by eye.
+
+#### Notes
+- Not yet tried with a real keyboard on a board (none attached).
 
 ---
 

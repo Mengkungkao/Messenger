@@ -27,10 +27,13 @@ sudo timedatectl set-timezone Australia/Sydney    # or your city
 
 ### 2. Try the button and a keyboard
 
-- 2 clicks on the chat → quick replies. Click moves, hold sends, and 2
-  clicks goes back.
-- Plug a USB keyboard into either board, type, and press Enter. It has
-  only been tested without a real keyboard.
+The controls are now MFruit OS's (2026-09-30):
+
+- 2 clicks on the chat → quick replies. Tap moves, a hold (then release)
+  sends, 2 clicks go back up the list, and 4 clicks close it.
+- 4 clicks on the chat leave the app.
+- Plug a USB keyboard into either board, type, and press Enter. Hold
+  Space to talk. It has only been tested without a real keyboard.
 
 ## Done when
 

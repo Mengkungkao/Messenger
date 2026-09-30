@@ -76,6 +76,7 @@ ui:
 input:
   debounce_ms: 75
   click_window_ms: 700
-  hold_ms: 350
+  hold_ms: 350                # the chat: talking starts this long into a hold
+  long_press_ms: 700          # the reply list: a hold sends after this, on release
   keyboard: auto              # type messages on stdin when it is a terminal
   physical_keyboard: true     # a USB/Bluetooth keyboard on the board: type, Enter sends

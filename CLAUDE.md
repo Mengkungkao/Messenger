@@ -1,3 +1,26 @@
+# LoRa Messenger — an MFruit OS app
+
+A chat between two radios (SX126X LoRa) on a Whisplay HAT: speech to
+text on the device, quick replies, typing. Raspberry Pi Zero 2 W and
+Orange Pi Zero 2W. Python 3.9+.
+
+- **Follow `.claude/rules/mfruit-os-app.md`** (MFruit OS app rules: one
+  input controller, the same controls and look as MFruit OS, lifecycle).
+- Input: `mfruit_sdk.input.InputController` → `Messenger._on_action`
+  (`main.py`): `_on_button` and `_on_key`. The chat is a talk screen
+  (`talk=`: reply list closed and speech recognition available); the
+  quick replies are an MFruit OS list. Footer hints come from `_hints()`,
+  states worth a coloured bar from `_status()` -- keep both in step with
+  the handlers.
+- Screen: `display/whisplay.py` `render(View)` is pure; MFruit OS's status
+  bar and footer via the SDK. Frames are pushed only on change: every
+  push deafens the radio for ~11 ms (the LCD's DC line is its M1).
+- `mfruit_sdk/` is vendored from MFruit OS -- never edit it here; change
+  `~/MFruitOS/mfruitos/sdk` and run `~/MFruitOS/scripts/sdk-sync.sh .`.
+- Tests: `python3 -m pytest -q` (no hardware). Previews: `python3 tools/preview.py`.
+
+---
+
 # Skill: Write Tests, Debug, and Update Documentation
 
 ## Purpose

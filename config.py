@@ -128,7 +128,11 @@ class UiConfig:
 class InputConfig:
     debounce_ms: int = 75
     click_window_ms: int = 700
+    # On the chat, talking starts this long into a hold.
     hold_ms: int = 350
+    # In the reply list a hold picks after this long, acting on release --
+    # MFruit OS's own long press, so lists feel the same in every app.
+    long_press_ms: int = 700
     # Type messages on stdin. "auto" = when stdin is a terminal.
     keyboard: str = "auto"
     # A USB or Bluetooth keyboard plugged into the board: type, Enter sends.

@@ -7,9 +7,12 @@ display/board.py. `render()` is a pure function from a `View` to a
 `Screen` pushes images to the daemon's framebuffer and runs the
 backlight.
 
+The look is MFruit OS's (the vendored MFruit App SDK, mfruit_sdk/): its
+status bar, fonts, colours and footer hints, so the Messenger feels like
+the rest of the device.
+
     ┌──────────────────────────────┐
-    │ 2/10    raspberrypi   -63dBm │  who, and how well we hear them
-    ├──────────────────────────────┤
+    │ raspberrypi        ≋  ▭ 82%  │  who we talk to; WiFi, battery
     │ ┌──────────────┐             │  received: left
     │ │ Where are    │             │
     │ │ you?         │             │
@@ -19,9 +22,9 @@ backlight.
     │             │ On my way    │ │
     │             └──────────────┘ │
     │                    12:04 ✓   │  delivered / sending… / ✗
-    │ > typing on a keyboard_      │  only while typing
-    │ [ Hold: talk · 2×: replies ] │  what the button does now
-    └──────────────────────────────┘
+    │ ┌ typing on a keyboard|    ┐ │  only while typing
+    │  hold talk  2× replies  4× exit │  what the button does now, or
+    └──────────────────────────────┘  a status pill (listening, sending)
 
 **Frames are only pushed when something changed.** On the stock LoRa
 HAT jumpers, the LCD's DC line is the radio's M1, and every frame push
@@ -36,26 +39,30 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from PIL import Image, ImageDraw, ImageFont
+from mfruit_sdk.ui import Canvas, Row, draw_list, footer, status_bar, to_rgb565
+from mfruit_sdk.ui import fonts as mfruit_fonts
+from mfruit_sdk.ui import theme as mfruit
+from PIL import Image
 
 from utils.logger import get_logger
 
 log = get_logger("display")
 
-WIDTH, HEIGHT = 240, 280
+WIDTH, HEIGHT = mfruit.SCREEN_W, mfruit.SCREEN_H
 CORNER_RADIUS = 20
+THEME = mfruit.DARK
 
-BG = (10, 12, 16)
-SURFACE = (24, 28, 36)
-BORDER = (58, 66, 82)
-TEXT = (236, 240, 246)
-DIM = (140, 150, 166)
-ACCENT = (86, 168, 255)     # our own messages
-OK = (64, 208, 138)         # received, delivered
-WARN = (245, 178, 62)       # in progress
-DANGER = (255, 92, 92)      # listening, failed
+BG = THEME.bg
+SURFACE = THEME.surface
+BORDER = THEME.separator
+TEXT = THEME.text
+DIM = THEME.text_muted
+ACCENT = THEME.accent       # the text cursor, the reply list
+OK = THEME.success          # received, delivered
+WARN = THEME.warning        # in progress, scrolled back
+DANGER = THEME.error        # listening, failed
 
-THEIRS = (44, 50, 62)       # received bubble
+THEIRS = (40, 45, 55)       # received bubble
 MINE = (30, 96, 186)        # sent bubble
 MINE_FAILED = (120, 40, 48)
 
@@ -66,37 +73,22 @@ META_TONES = {"dim": DIM, "ok": OK, "busy": WARN, "error": DANGER}
 LED = {"idle": (0, 6, 10), "listen": (60, 0, 0), "busy": (40, 24, 0),
        "ok": (0, 40, 16), "error": (60, 0, 0)}
 
-# Layout, in pixels.
-HEADER_H = 34
-STATUS_TOP, STATUS_BOTTOM = 240, 266     # kept inside the panel's rounded corners
-SIDE = 8                                 # gap between a bubble and the screen edge
+# Layout, in pixels: MFruit OS's status bar above, its footer below.
+CONTENT_TOP, CONTENT_BOTTOM = mfruit.CONTENT_TOP, mfruit.CONTENT_BOTTOM
+STATUS_TOP, STATUS_BOTTOM = 250, 272     # the status pill, where the hints go
+SIDE = 10                                # gap between a bubble and the screen edge
 BUBBLE_MAX_W = 176
 PAD_X, PAD_Y = 9, 5
 TEXT_SIZE, LINE_H = 15, 19
 META_SIZE, META_H = 11, 14
 GAP = 5                                  # between one message and the next
-
-_FONTS = {
-    "regular": ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
-    "bold": ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
-}
-_font_cache = {}
+# The other radio's name is data: shrink it before cutting it.
+TITLE_SIZES = (17, 15, 13)
 
 
 def font(size: int, weight: str = "regular"):
-    key = (size, weight)
-    if key not in _font_cache:
-        for path in _FONTS[weight]:
-            try:
-                _font_cache[key] = ImageFont.truetype(path, size)
-                break
-            except OSError:
-                continue
-        else:
-            _font_cache[key] = ImageFont.load_default()
-    return _font_cache[key]
+    """MFruit OS's font (Inter; DejaVu where MFruit OS is not installed)."""
+    return mfruit_fonts.font(size, weight)
 
 
 @dataclass
@@ -122,17 +114,18 @@ class Picker:
 @dataclass
 class View:
     """Everything on screen, as data."""
-    title: str = "LoRa Messenger"
-    signal: str = ""            # "-63 dBm", the last packet heard
+    title: str = "Messenger"
     position: str = ""          # "8/10" while scrolled back
     bubbles: list = field(default_factory=list)     # oldest first
     anchor: int | None = None   # bubble at the bottom when scrolled; None = newest
     empty_hint: list = field(default_factory=list)  # lines shown with no messages
     compose: str | None = None  # being typed on a keyboard
     picker: Picker | None = None
-    status: str = "Ready"
+    hints: list = field(default_factory=list)       # [(gesture, action)] for the footer
+    status: str = ""            # a state worth a pill instead of the hints
     status_tone: str = "idle"
     level: float = 0.0          # mic level 0..1 while listening
+    device: object = None       # mfruit_sdk.status.Status: WiFi and battery
 
 
 def _width(draw, text, face) -> int:
@@ -179,33 +172,6 @@ def wrap(draw, text: str, face, width: int) -> list:
 
 # --- the parts of the screen ---------------------------------------------------
 
-def _header(draw, view: View):
-    draw.rectangle((0, 0, WIDTH, HEADER_H), fill=SURFACE)
-    draw.line((0, HEADER_H, WIDTH, HEADER_H), fill=BORDER)
-    # 12 px down, the panel's rounded corners are only 2 px in: the edge
-    # text can sit 8 px from the sides.
-    small = font(11)
-    left = _width(draw, view.position, small) + 10 if view.position else 0
-    right = _width(draw, view.signal, small) + 10 if view.signal else 0
-    # Centred on the screen when it fits there, else in the room left
-    # between the position and the signal: "orangepizero2w" must not lose
-    # half its name to symmetry.
-    lo, hi = 8 + left, WIDTH - 8 - right
-    for size in (16, 15, 14):               # a size smaller before an ellipsis
-        face = font(size, "bold")
-        if _width(draw, view.title, face) <= hi - lo:
-            break
-    title = _fit(draw, view.title, face, hi - lo)
-    width = _width(draw, title, face)
-    x = min(max((WIDTH - width) // 2, lo), hi - width)
-    draw.text((x, 8 + (16 - size) // 2), title, font=face, fill=TEXT)
-    if view.position:
-        draw.text((8, 12), view.position, font=small, fill=WARN)
-    if view.signal:
-        draw.text((WIDTH - 8 - _width(draw, view.signal, small), 12), view.signal,
-                  font=small, fill=DIM)
-
-
 def _bubble_block(draw, bubble: Bubble):
     """(height, draw(canvas, y)) for one message: sender, bubble, meta line."""
     face = font(TEXT_SIZE)
@@ -225,7 +191,7 @@ def _bubble_block(draw, bubble: Bubble):
                         font=small, fill=OK)
             y += sender_h
         fill = (MINE_FAILED if bubble.failed else MINE) if bubble.mine else THEIRS
-        canvas.rounded_rectangle((x, y, x + bubble_w, y + bubble_h), radius=9, fill=fill,
+        canvas.rounded_rectangle((x, y, x + bubble_w, y + bubble_h), radius=10, fill=fill,
                                  outline=WARN if bubble.selected else None,
                                  width=2 if bubble.selected else 1)
         for index, line in enumerate(lines):
@@ -241,117 +207,102 @@ def _bubble_block(draw, bubble: Bubble):
     return height, paint
 
 
-def _chat(image, draw, view: View, top: int, bottom: int):
+def _chat(c: Canvas, view: View, top: int, bottom: int):
     """Bubbles from the bottom up; whatever does not fit scrolls off the top."""
-    area = Image.new("RGB", (WIDTH, bottom - top), BG)
-    canvas = ImageDraw.Draw(area)
+    area = c.layer(WIDTH, bottom - top)
+    canvas = area.draw
     if not view.bubbles:
-        face = font(13)
         lines = view.empty_hint or ["No messages yet"]
         y = (bottom - top - len(lines) * 20) // 2
         for index, line in enumerate(lines):
-            colour = TEXT if index == 0 else DIM
-            canvas.text(((WIDTH - _width(canvas, line, face)) // 2, y + index * 20), line,
-                        font=font(13, "bold") if index == 0 else face, fill=colour)
+            area.text(WIDTH // 2, y + index * 20, line, 14 if index == 0 else 13,
+                      "semibold" if index == 0 else "regular",
+                      TEXT if index == 0 else DIM, anchor="ma", max_width=WIDTH - 2 * SIDE)
     else:
         last = len(view.bubbles) - 1 if view.anchor is None else view.anchor
         newer = len(view.bubbles) - 1 - last
         y = bottom - top - (22 if newer else 2)     # room for "▼ 2 newer"
-        for bubble in reversed(view.bubbles[:last + 1]):
+        for count, bubble in enumerate(reversed(view.bubbles[:last + 1])):
             height, paint = _bubble_block(canvas, bubble)
+            if count and y - height < 0:
+                # Whole messages only: none half cut under the status bar.
+                # (The newest is drawn even when it alone is too tall, so
+                # its end -- what was said last -- is always on screen.)
+                break
             y -= height
             paint(canvas, y)
             y -= GAP
             if y < 0:
                 break
         if newer:
-            note = f"▼ {newer} newer"
-            small = font(META_SIZE, "bold")
-            w = _width(canvas, note, small) + 12
-            canvas.rounded_rectangle(((WIDTH - w) // 2, bottom - top - 18,
-                                      (WIDTH + w) // 2, bottom - top - 2),
-                                     radius=7, fill=WARN)
-            canvas.text(((WIDTH - w) // 2 + 6, bottom - top - 17), note, font=small, fill=BG)
-    image.paste(area, (0, top))
+            note = f"{view.position}  ▼ {newer} newer" if view.position else f"▼ {newer} newer"
+            w = area.text_width(note, META_SIZE, "bold") + 14
+            area.rounded(((WIDTH - w) // 2, bottom - top - 18, (WIDTH + w) // 2,
+                          bottom - top - 2), 8, fill=WARN)
+            area.text(WIDTH // 2, bottom - top - 10, note, META_SIZE, "bold", BG, anchor="mm")
+    c.image.paste(area.image, (0, top))
 
 
-def _compose(draw, text: str, bottom: int) -> int:
-    """The line being typed, above the status bar. Returns its top."""
+def _compose(c: Canvas, text: str, bottom: int) -> int:
+    """The line being typed, above the footer. Returns its top."""
     face = font(14)
-    inner = WIDTH - 2 * SIDE - 16
-    lines = wrap(draw, f"{text}▏", face, inner) or ["▏"]
+    inner = WIDTH - 2 * SIDE - 20
+    lines = wrap(c.draw, text, face, inner) or [""]
     lines = lines[-2:]                      # the end is what is being typed
-    height = len(lines) * 18 + 8
+    height = len(lines) * 18 + 10
     top = bottom - height
-    draw.rounded_rectangle((SIDE, top, WIDTH - SIDE, bottom), radius=8, fill=SURFACE,
-                           outline=ACCENT, width=1)
+    c.rounded((SIDE, top, WIDTH - SIDE, bottom), 10, fill=SURFACE, outline=ACCENT)
     for index, line in enumerate(lines):
-        draw.text((SIDE + 8, top + 4 + index * 18), line, font=face, fill=TEXT)
+        c.draw.text((SIDE + 9, top + 5 + index * 18), line, font=face, fill=TEXT)
+    # A drawn cursor: MFruit OS's font has no "▏".
+    cursor_x = SIDE + 9 + _width(c.draw, lines[-1], face) + 1
+    cursor_y = top + 5 + (len(lines) - 1) * 18
+    c.rect((cursor_x, cursor_y + 2, cursor_x + 1, cursor_y + 16), ACCENT)
     return top
 
 
-def _picker(draw, picker: Picker, top: int, bottom: int):
-    draw.rectangle((0, top, WIDTH, bottom), fill=BG)
-    face, bold = font(15), font(15, "bold")
-    draw.text((SIDE + 4, top + 4), picker.title, font=font(13, "bold"), fill=DIM)
-    back = "2×: back"
-    draw.text((WIDTH - SIDE - 4 - _width(draw, back, font(12)), top + 5), back,
-              font=font(12), fill=DIM)
-    row_h, first_y = 26, top + 24
-    rows = max(1, (bottom - first_y) // row_h)
-    count = len(picker.items)
-    # Keep the highlighted row in view, a little below the top when it can be.
-    start = min(max(0, picker.index - 1), max(0, count - rows))
-    for row, index in enumerate(range(start, min(count, start + rows))):
-        y = first_y + row * row_h
-        chosen = index == picker.index
-        if chosen:
-            draw.rounded_rectangle((SIDE, y, WIDTH - SIDE, y + row_h - 3), radius=8,
-                                   fill=MINE)
-        label = _fit(draw, str(picker.items[index]), bold if chosen else face,
-                     WIDTH - 2 * SIDE - 16)
-        draw.text((SIDE + 8, y + 3), label, font=bold if chosen else face,
-                  fill=TEXT if chosen else DIM)
-    if start > 0:
-        draw.text((WIDTH - SIDE - 14, first_y + 6), "▲", font=font(11), fill=DIM)
-    if start + rows < count:
-        draw.text((WIDTH - SIDE - 12, bottom - 14), "▼", font=font(11), fill=DIM)
+def _picker(c: Canvas, picker: Picker, top: int, bottom: int):
+    c.rect((0, top, WIDTH, bottom), BG)
+    rows = [Row(str(item)) for item in picker.items]
+    draw_list(c, rows, picker.index, top=top, bottom=bottom)
 
 
-def _status(draw, view: View):
+def _status(c: Canvas, view: View):
     pill = (14, STATUS_TOP, WIDTH - 14, STATUS_BOTTOM)
-    draw.rounded_rectangle(pill, radius=9, fill=TONES.get(view.status_tone, SURFACE))
+    c.rounded(pill, 11, fill=TONES.get(view.status_tone, SURFACE))
     if view.status_tone == "listen" and view.level > 0:
         fill_w = int((pill[2] - pill[0]) * min(1.0, view.level))
-        draw.rounded_rectangle((pill[0], pill[1], pill[0] + fill_w, pill[3]),
-                               radius=9, fill=(255, 150, 150))
-    face = font(13, "bold")
-    status = _fit(draw, view.status, face, pill[2] - pill[0] - 12)
-    draw.text(((WIDTH - _width(draw, status, face)) // 2, STATUS_TOP + 5), status,
-              font=face, fill=TONE_TEXT.get(view.status_tone, TEXT))
+        c.rounded((pill[0], pill[1], pill[0] + fill_w, pill[3]), 11, fill=(255, 150, 150))
+    c.text(WIDTH // 2, (STATUS_TOP + STATUS_BOTTOM) // 2, view.status, 13, "semibold",
+           TONE_TEXT.get(view.status_tone, TEXT), anchor="mm",
+           max_width=pill[2] - pill[0] - 16)
 
 
 def render(view: View) -> Image.Image:
-    image = Image.new("RGB", (WIDTH, HEIGHT), BG)
-    draw = ImageDraw.Draw(image)
-    _header(draw, view)
-    bottom = STATUS_TOP - 4
+    c = Canvas(theme=THEME)
+    title = view.picker.title if view.picker is not None else view.title
+    status_bar(c, title, view.device, title_sizes=TITLE_SIZES)
+    bottom = CONTENT_BOTTOM
     if view.compose is not None:
-        bottom = _compose(draw, view.compose, bottom) - 4
+        bottom = _compose(c, view.compose, bottom) - 4
     if view.picker is not None:
-        _picker(draw, view.picker, HEADER_H + 1, bottom)
+        _picker(c, view.picker, CONTENT_TOP, bottom)
     else:
-        _chat(image, draw, view, HEADER_H + 1, bottom)
-    _status(draw, view)
-    return image
+        _chat(c, view, CONTENT_TOP, bottom)
+    if view.status:
+        _status(c, view)
+    else:
+        footer(c, view.hints)
+    return c.image
 
 
 def image_to_rgb565(image: Image.Image) -> bytes:
-    """RGB image -> big-endian RGB565, the daemon's framebuffer format."""
-    import numpy as np
-    arr = np.asarray(image.convert("RGB"), dtype=np.uint16)
-    packed = ((arr[:, :, 0] & 0xF8) << 8) | ((arr[:, :, 1] & 0xFC) << 3) | (arr[:, :, 2] >> 3)
-    return packed.astype(">u2").tobytes()
+    """RGB image -> big-endian RGB565, the daemon's framebuffer format.
+
+    MFruit App SDK's lookup-table converter: no numpy, ~11 ms per frame on
+    a Pi Zero 2 W.
+    """
+    return to_rgb565(image)
 
 
 class Screen:
