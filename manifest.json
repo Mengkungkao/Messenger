@@ -1,0 +1,12 @@
+{
+  "id": "whisplay-lora-messenger",
+  "name": "Messenger",
+  "version": "1.0.0",
+  "description": "Radio Message",
+  "entrypoint": "run.sh",
+  "repository": "https://github.com/Mengkungkao/Messenger",
+  "exit_gesture": "none",
+  "disable_esc_exit_key": true,
+  "priority": 44,
+  "persist": [".venv", "config.yaml"]
+}

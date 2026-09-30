@@ -12,6 +12,9 @@ footer hints, and the controls every MFruit app shares (the vendored MFruit
 App SDK in `mfruit_sdk/`), with a **USB or Bluetooth keyboard** working
 wherever the button does.
 
+MFruit OS lists it as **Messenger**, with **Radio Message** underneath. The
+included `manifest.json` supplies this description using the existing app ID.
+
 Hardware per radio: a Raspberry Pi or Orange Pi Zero 2W, a **Whisplay HAT**
 (240×280 LCD, one button, RGB LED, microphone and speaker) and a
 **Waveshare SX126X LoRa HAT** (E22-900T22S). This is a sibling of
