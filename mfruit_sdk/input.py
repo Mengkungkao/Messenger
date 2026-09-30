@@ -38,6 +38,7 @@ thread; keep it short (update state, wake your render loop).
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Callable, NamedTuple
@@ -83,7 +84,8 @@ class InputController:
                  on_armed: Callable[[bool], None] | None = None,
                  click_window_ms: int = 400, long_press_ms: int = 700, debounce_ms: int = 75,
                  talk_press_ms: int | None = None,
-                 keyboard: bool = True, clock: Callable[[], float] = time.monotonic,
+                 keyboard: bool = True, app_id: str | None = None,
+                 clock: Callable[[], float] = time.monotonic,
                  threaded: bool = True):
         self.on_action = on_action
         self.talk = talk
@@ -100,7 +102,10 @@ class InputController:
         self.gestures = ButtonGestures(self._on_gesture, click_window_ms=click_window_ms,
                                        long_press_ms=long_press_ms, debounce_ms=debounce_ms,
                                        clock=clock, threaded=threaded, hold_after=hold_after)
-        self.keys = KeyReader(self.key_event) if keyboard else None
+        # The app's id lets MFruit OS's key hub route keys to it while it has
+        # the screen (see keys.py); WHISPLAY_APP_ID is set by mfruit-run.
+        app_id = app_id or os.environ.get("WHISPLAY_APP_ID") or None
+        self.keys = KeyReader(self.key_event, app_id=app_id) if keyboard else None
         self._lock = threading.RLock()
         self._armed = False
         self._talking = None        # None | BUTTON | KEYBOARD

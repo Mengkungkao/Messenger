@@ -1,11 +1,18 @@
-"""USB and Bluetooth keyboards, read straight from /dev/input/event*.
+"""USB and Bluetooth keyboards, from /dev/input/event* or MFruit OS's key hub.
 
-whisplay-daemon reads keyboards too, but hands keys only to its built-in
-pages; for an external app it acts on Esc alone (it closes the app unless
-the app registers with ``disable_esc_exit_key``). So every MFruit app reads
-the keyboard itself. Nobody grabs the device: every reader gets every event,
-which is why a reader must ignore keys while its app does not own the screen
-(``InputController`` does that).
+**While MFruit OS runs it holds every keyboard exclusively** (EVIOCGRAB,
+``grab=True``) and passes each key to the program that owns the screen,
+through its key hub (``state/keys.sock``): itself, or the foreground app.
+Without that, every key also reaches the Linux console -- on a board whose
+console logs a shell in automatically, typing into an app typed into that
+shell too (it restarted MFruit OS from the shell's history). An app's
+reader (``app_id=...``) connects to the hub by itself when MFruit OS runs,
+and reads the devices directly when it does not.
+
+whisplay-daemon hands keys only to its own pages (and closes an external
+app on Esc unless it registers ``disable_esc_exit_key``), so apps never
+relied on it for keys. A reader must still ignore keys pressed while its
+app did not own the screen (``InputController`` does that).
 
 Only devices with letter keys count as keyboards: the Orange Pi's power
 button, its ADC buttons and its IR receiver are input devices too. A
@@ -26,9 +33,13 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import fcntl
+import glob
+import json
 import logging
 import os
 import select
+import socket
 import struct
 import threading
 from typing import Callable, NamedTuple, Optional
@@ -38,6 +49,10 @@ log = logging.getLogger("mfruit_sdk.keys")
 INPUT_DIR = "/dev/input"
 SYS_INPUT_DIR = "/sys/class/input"
 RESCAN_SECONDS = 2.0
+HUB_NAME = "keys.sock"
+# ioctl(fd, EVIOCGRAB, 1): only this file descriptor receives the device's
+# events -- not the Linux console, not other readers. _IOW('E', 0x90, int).
+EVIOCGRAB = 0x40044590
 
 EV_KEY = 0x01
 UP, DOWN, REPEAT = 0, 1, 2
@@ -199,16 +214,49 @@ class DeviceWatch:
             pass
 
 
+def hub_socket_path() -> Optional[str]:
+    """MFruit OS's key hub, if MFruit OS is running on this board.
+
+    While it runs, MFruit OS holds every keyboard exclusively (so the Linux
+    console, the daemon and stray readers get nothing) and hands each key
+    to the program that owns the screen, through this socket.
+    """
+    candidates = [os.environ.get("MFRUIT_KEYS_SOCKET", "")]
+    for home in (os.environ.get("MFRUIT_HOME", ""), os.environ.get("WHISPLAY_OS_HOME", ""),
+                 os.path.expanduser("~/.whisplay-os")):
+        if home:
+            candidates.append(os.path.join(home, "state", HUB_NAME))
+    candidates += sorted(glob.glob(os.path.join("/home/*/.whisplay-os/state", HUB_NAME)))
+    return next((path for path in candidates if path and os.path.exists(path)), None)
+
+
 class KeyReader:
-    """Reads every keyboard on the board on its own thread; calls ``on_event(KeyEvent)``."""
+    """Reads the keyboards on its own thread; calls ``on_event(KeyEvent)``.
+
+    With ``app_id`` (an app): while MFruit OS runs, keys come from its key
+    hub -- only while this app owns the screen -- otherwise straight from
+    the devices. MFruit OS itself reads the devices with ``grab=True``.
+    ``on_devices(list)`` is called when the set of keyboards changes.
+    """
 
     def __init__(self, on_event: Callable[[KeyEvent], None], input_dir: str = INPUT_DIR,
-                 sys_dir: str = SYS_INPUT_DIR, rescan_seconds: float = RESCAN_SECONDS):
+                 sys_dir: str = SYS_INPUT_DIR, rescan_seconds: float = RESCAN_SECONDS,
+                 grab: bool = False, app_id: Optional[str] = None, hub=None,
+                 on_devices: Optional[Callable[[list], None]] = None):
         self.on_event = on_event
         self.input_dir = input_dir
         self.sys_dir = sys_dir
         self.rescan = rescan_seconds
+        self.grab = grab
+        self.app_id = app_id
+        # None: find MFruit OS's hub when there is an app_id; False: never;
+        # a path: that socket.
+        self.hub = hub
+        self.on_devices = on_devices
         self._open = {}             # fd -> (name, decoder)
+        self._lock = threading.Lock()
+        self._hub_devices = None    # keyboards the hub reports, while connected to it
+        self._reported = None
         self._stop = threading.Event()
         self._wake = None           # pipe that interrupts select() on stop()
         self._thread = None
@@ -216,12 +264,18 @@ class KeyReader:
     @property
     def connected(self) -> bool:
         """Is a keyboard plugged in (and readable) right now?"""
-        return bool(self._open)
+        return bool(self.devices)
 
     @property
     def devices(self) -> list:
         """eventN names of the keyboards being read right now."""
+        if self._hub_devices is not None:
+            return list(self._hub_devices)
         return sorted(name for name, _ in list(self._open.values()))
+
+    @property
+    def via_hub(self) -> bool:
+        return self._hub_devices is not None
 
     def keyboards(self) -> list:
         """eventN names of the input devices that are keyboards."""
@@ -268,6 +322,170 @@ class KeyReader:
                     pass
             self._wake = None
 
+    def set_grab(self, grab: bool):
+        """Hold the keyboards exclusively, or let other readers have them too."""
+        with self._lock:
+            self.grab = grab
+            for fd, (name, _) in list(self._open.items()):
+                self._apply_grab(fd, name)
+
+    def _apply_grab(self, fd, name):
+        try:
+            fcntl.ioctl(fd, EVIOCGRAB, 1 if self.grab else 0)
+        except OSError as exc:
+            log.warning("cannot %s keyboard %s: %s", "grab" if self.grab else "release",
+                        name, exc)
+
+    def _report_devices(self):
+        devices = self.devices
+        if devices != self._reported:
+            self._reported = devices
+            if self.on_devices:
+                try:
+                    self.on_devices(devices)
+                except Exception:
+                    log.exception("keyboard list handler failed")
+
+    # --------------------------------------------------------------- loop
+    def _hub_path(self) -> Optional[str]:
+        if self.hub is False or self.grab:
+            return None
+        if isinstance(self.hub, str):
+            return self.hub if os.path.exists(self.hub) else None
+        return hub_socket_path() if self.app_id else None
+
+    def _loop(self):
+        try:
+            while not self._stop.is_set():
+                path = self._hub_path()
+                if path and self._run_hub(path):
+                    continue            # the hub went away (MFruit OS restarting): look again
+                self._run_direct()
+        finally:
+            self._hub_devices = None
+
+    def _run_direct(self):
+        """Read the devices until stop() -- or, for an app, until MFruit OS's hub appears."""
+        wake = self._wake[0]
+        watch = DeviceWatch.open(self.input_dir)
+        hub_dir = None
+        if self.app_id and self.hub is not False and not self.grab:
+            state = os.path.dirname(hub_socket_path() or os.path.join(
+                os.environ.get("MFRUIT_HOME") or os.path.expanduser("~/.whisplay-os"),
+                "state", HUB_NAME))
+            hub_dir = state if os.path.isdir(state) else None
+        hub_watch = DeviceWatch.open(hub_dir) if hub_dir else None
+        rescan = True
+        try:
+            while not self._stop.is_set():
+                if rescan:
+                    with self._lock:
+                        self._scan()
+                    self._report_devices()
+                    rescan = False
+                    if self._hub_path() and self._hub_reachable():
+                        return          # MFruit OS is running: take keys from it
+                # Wait for keys, for stop(), for a device to come or go --
+                # or, without inotify, for the next look round.
+                fds = list(self._open) + [wake] + [w.fd for w in (watch, hub_watch) if w]
+                try:
+                    ready, _, _ = select.select(fds, [], [],
+                                                None if watch else self.rescan)
+                except (OSError, ValueError):
+                    with self._lock:
+                        for fd in list(self._open):
+                            self._close(fd)
+                    self._stop.wait(self.rescan)
+                    rescan = True
+                    continue
+                if not ready and not watch:
+                    rescan = True
+                for fd in ready:
+                    if fd == wake:
+                        continue
+                    if watch and fd == watch.fd:
+                        watch.drain()
+                        rescan = True
+                    elif hub_watch and fd == hub_watch.fd:
+                        hub_watch.drain()
+                        rescan = True
+                    elif not self._read(fd):
+                        rescan = True        # it went away: look again
+        finally:
+            with self._lock:
+                for fd in list(self._open):
+                    self._close(fd)
+            for w in (watch, hub_watch):
+                if w:
+                    w.close()
+
+    def _hub_reachable(self) -> bool:
+        path = self._hub_path()
+        if not path:
+            return False
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(1.0)
+                probe.connect(path)
+            return True
+        except OSError:
+            return False                 # a socket left behind by a crash
+
+    def _run_hub(self, path: str) -> bool:
+        """Take keys from MFruit OS's hub until it goes away. False: could not connect."""
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(3.0)
+            sock.connect(path)
+            sock.sendall((json.dumps({"app_id": self.app_id}) + "\n").encode("utf-8"))
+            sock.settimeout(None)
+        except OSError as exc:
+            log.debug("key hub %s not reachable: %s", path, exc)
+            return False
+        log.info("keyboard through MFruit OS (%s)", path)
+        self._hub_devices = []
+        held = {}                        # code -> name: named keys down, via the hub
+        wake = self._wake[0]
+        buffer = b""
+        try:
+            while not self._stop.is_set():
+                ready, _, _ = select.select([sock, wake], [], [])
+                if wake in ready:
+                    break
+                data = sock.recv(4096)
+                if not data:
+                    break                # MFruit OS stopped
+                buffer += data
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if line.strip():
+                        self._hub_message(json.loads(line.decode("utf-8")), held)
+        except (OSError, ValueError) as exc:
+            log.debug("key hub connection ended: %s", exc)
+        finally:
+            sock.close()
+            self._hub_devices = None
+            self._reported = None
+            # Keys held when the hub went away are let go of: a held Space
+            # must not leave the microphone open.
+            self._dispatch([KeyEvent("key", name, UP, code) for code, name in held.items()])
+        return True
+
+    def _hub_message(self, message: dict, held: dict):
+        kind = message.get("type")
+        if kind == "keyboards":
+            self._hub_devices = [str(d) for d in message.get("devices", [])]
+            self._report_devices()
+        elif kind == "key":
+            event = KeyEvent(str(message["kind"]), str(message["value"]), int(message["action"]),
+                             int(message["code"]))
+            if event.kind == "key":
+                if event.action == DOWN:
+                    held[event.code] = event.value
+                elif event.action == UP:
+                    held.pop(event.code, None)
+            self._dispatch([event])
+
     def _scan(self):
         wanted = set(self.keyboards())
         for fd, (name, _) in list(self._open.items()):
@@ -281,7 +499,9 @@ class KeyReader:
                 log.debug("cannot read keyboard %s: %s", name, exc)
                 continue
             self._open[fd] = (name, KeyDecoder())
-            log.info("keyboard connected: %s", name)
+            if self.grab:
+                self._apply_grab(fd, name)
+            log.info("keyboard connected: %s%s", name, " (held exclusively)" if self.grab else "")
 
     def _close(self, fd):
         name, decoder = self._open.pop(fd, (None, None))
@@ -294,43 +514,6 @@ class KeyReader:
         if name:
             log.info("keyboard gone: %s", name)
 
-    def _loop(self):
-        wake = self._wake[0]
-        watch = DeviceWatch.open(self.input_dir)
-        rescan = True
-        try:
-            while not self._stop.is_set():
-                if rescan:
-                    self._scan()
-                    rescan = False
-                # Wait for keys, for stop(), for a device to come or go --
-                # or, without inotify, for the next look round.
-                fds = list(self._open) + [wake] + ([watch.fd] if watch else [])
-                try:
-                    ready, _, _ = select.select(fds, [], [],
-                                                None if watch else self.rescan)
-                except (OSError, ValueError):
-                    for fd in list(self._open):
-                        self._close(fd)
-                    self._stop.wait(self.rescan)
-                    rescan = True
-                    continue
-                if not ready and not watch:
-                    rescan = True
-                for fd in ready:
-                    if fd == wake:
-                        continue
-                    if watch and fd == watch.fd:
-                        watch.drain()
-                        rescan = True
-                    elif not self._read(fd):
-                        rescan = True        # it went away: look again
-        finally:
-            for fd in list(self._open):
-                self._close(fd)
-            if watch:
-                watch.close()
-
     def _read(self, fd) -> bool:
         """Read and dispatch what is waiting; False if the device went away."""
         try:
@@ -338,7 +521,8 @@ class KeyReader:
         except BlockingIOError:
             return True
         except OSError:
-            self._close(fd)          # unplugged, or the Bluetooth link dropped
+            with self._lock:
+                self._close(fd)          # unplugged, or the Bluetooth link dropped
             return False
         if data and fd in self._open:
             self._dispatch(self._open[fd][1].feed(data))

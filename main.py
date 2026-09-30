@@ -127,7 +127,8 @@ class Messenger:
             click_window_ms=config.input.click_window_ms,
             long_press_ms=config.input.long_press_ms,
             talk_press_ms=config.input.hold_ms,
-            keyboard=config.input.physical_keyboard)
+            keyboard=config.input.physical_keyboard,
+            app_id=board_module.APP_ID)    # MFruit OS hands its keys to this app by id
         self.input.attach(board)
         for hook, handler in (("on_exit_request", lambda *_: self.stop("daemon")),
                               ("on_focus_revoked", self._on_focus_revoked)):
