@@ -41,10 +41,12 @@ Source of truth: `MFruitOS/docs/APP_RULES.md`. Copies live in each app at
 - While the user is typing (`typing=` returns True), Space types a space.
 - **Act only while the app owns the screen.** Pass
   `active=lambda: board.foreground_ready` and call `controller.reset()` when
-  focus is revoked. The keyboard is shared by every process (nobody grabs
-  it); the controller ignores keys that went down while another app had the
-  screen. An app that keeps running in the background must never act on
-  keys or the button.
+  focus is revoked. Pass `app_id=APP_ID` to the controller (or inherit
+  `WHISPLAY_APP_ID` from mfruit-run). MFruit OS exclusively grabs keyboards
+  and forwards keys through its key hub; direct `/dev/input` readers receive
+  nothing while it runs. SDK 1.2.0 uses the hub and falls back to evdev only
+  without a reachable hub. The controller ignores keys that went down while
+  another app had the screen. Background apps must never act on input.
 - Footer hints and the handler come from **one table**, so the screen can
   never advertise a gesture the code does not implement.
 - A press on a dark (dimmed-off) screen only wakes it.

@@ -14,4 +14,4 @@ which is what lets the same files work under either package name.
 See APP_DEVELOPMENT.md ("MFruit App SDK") and docs/APP_RULES.md.
 """
 
-SDK_VERSION = "1.1.0"
+SDK_VERSION = "1.2.0"
