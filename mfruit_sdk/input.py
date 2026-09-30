@@ -23,8 +23,9 @@ hold is taken. Everywhere else a hold *arms* at ``long_press_ms``
 (``on_armed(True)``, show "release to open") and selects on release.
 While ``typing()`` is true, Space types a space instead of talking.
 
-**Ownership.** The keyboard is shared by every process (nobody grabs it) and
-the button is routed by whisplay-daemon, so the controller acts only while
+**Ownership.** MFruit OS grabs keyboards exclusively and forwards keys to
+the foreground app through its key hub. Without a hub, the SDK reads evdev.
+The button is routed by whisplay-daemon. The controller acts only while
 ``active()`` is true (the app owns the screen), and only on keys it saw go
 down while active: a key-up or auto-repeat of a key pressed elsewhere (the
 Enter that launched this app, the Esc that closed the previous one) is

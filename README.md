@@ -12,6 +12,9 @@ footer hints, and the controls every MFruit app shares (the vendored MFruit
 App SDK in `mfruit_sdk/`), with a **USB or Bluetooth keyboard** working
 wherever the button does.
 
+MFruit OS lists it as **Messenger**, with **Radio Message** underneath. The
+included `manifest.json` supplies this description using the existing app ID.
+
 Hardware per radio: a Raspberry Pi or Orange Pi Zero 2W, a **Whisplay HAT**
 (240×280 LCD, one button, RGB LED, microphone and speaker) and a
 **Waveshare SX126X LoRa HAT** (E22-900T22S). This is a sibling of
@@ -675,5 +678,17 @@ tests/               141 tests; fakes.py models the E22 module
 - Messages are not encrypted. Anyone on the frequency with this app can
   read them. WalkieTalkie's paired encryption could be carried over if
   that matters.
-# Messenger
-# Messenger
+
+## MFruit OS 1.4.0 keyboard compatibility
+
+Vendored SDK 1.2.0 reads keys from MFruit OS's foreground key hub while the
+launcher holds keyboards exclusively. Standalone use falls back to evdev.
+Deploy this SDK with MFruit OS 1.4.0 so keyboard input continues to work.
+
+
+## MFruit OS lifecycle validation
+
+Managed launches preserve MFruit OS's launch wrapper and logging registration;
+standalone launches still register themselves. A hold on a dark talk screen
+only wakes it. Release, then hold again to record. Regression coverage lives
+in `tests/test_board_registration.py` and `tests/test_controls.py`.

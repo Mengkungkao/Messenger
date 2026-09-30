@@ -219,6 +219,8 @@ def acquire_board(launch_command: str | None = None,
         return NullBoard(), "headless"
 
     project_root = Path(__file__).resolve().parents[1]
+    managed = (os.getenv("WHISPLAY_APP_ID") == APP_ID
+               and bool(os.getenv("MFRUIT_SESSION") or os.getenv("WHISPLAY_OS_APP_DIR")))
     launch_command = launch_command or str(project_root / "run.sh")
     launch_cwd = launch_cwd or str(project_root)
 
@@ -246,7 +248,10 @@ def acquire_board(launch_command: str | None = None,
             log.exception("direct hardware access failed; running headless")
             return NullBoard(), "headless"
 
-    proxy.register()
+    # MFruit OS already registered mfruit-run and its log destination.
+    # Re-registering our standalone command would replace that wrapper.
+    if not managed:
+        proxy.register()
     # Esc is this app's "back" (MFruit OS controls). Claimed now, before
     # taking the screen: every registration makes the daemon redraw its
     # desktop, which would flash over our first frame.

@@ -59,6 +59,15 @@ def test_keyboard_text_commands_and_recording():
     assert commands == ["talk", "talk-stop", "history", "eof"]
 
 
+def test_empty_keyboard_commands_do_not_stop_typing():
+    sent, commands = [], []
+    keyboard = Keyboard(sent.append, commands.append,
+                        stream=io.StringIO("/\n/   \nhello\n/HELP\n"))
+    keyboard._run()
+    assert sent == ["hello"]
+    assert commands == ["help", "eof"]
+
+
 def test_sim_air_splits_host_writes_into_packets():
     first = protocol.text_packet(1, 0xFFFF, 1, "one").encode()
     second = protocol.ack_packet(2, protocol.text_packet(1, 2, 5, "x")).encode()

@@ -50,7 +50,9 @@ class Keyboard:
             if not line:
                 continue
             if line.startswith("/"):
-                self.on_command(line[1:].split()[0].lower())
+                words = line[1:].split()
+                if words:
+                    self.on_command(words[0].lower())
             else:
                 self.on_text(line)
         self.on_command("eof")

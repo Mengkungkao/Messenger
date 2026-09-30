@@ -401,6 +401,10 @@ class Messenger:
     def _on_action(self, action):
         """One MFruit OS input action, from the button or a keyboard."""
         if action.name == TALK_START:
+            if not self.screen.awake:
+                self.screen.poke()
+                self._wake.set()
+                return  # waking a dark chat must not record a message
             self._on_talk_start()
             return
         if action.name == TALK_END:

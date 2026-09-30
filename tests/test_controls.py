@@ -86,6 +86,20 @@ def test_a_click_on_a_dark_screen_only_wakes_it(app):
     assert app.picker is None and app.screen.awake
 
 
+def test_a_hold_on_a_dark_screen_only_wakes_it(app):
+    app.screen.set_backlight(0)
+    app.input.press()
+    step(app, app.config.input.hold_ms / 1000 + 0.01)
+    assert app.screen.awake and not app.listening
+    app.input.release()
+    assert not app.listening and sent(app) == []
+    step(app, 0.2)
+    app.input.press()
+    step(app, app.config.input.hold_ms / 1000 + 0.01)
+    assert app.listening
+    app.input.release()
+
+
 def test_nothing_while_another_app_has_the_screen(app):
     app.board.foreground_ready = False
     tap(app, 2)
