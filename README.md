@@ -378,6 +378,20 @@ tools/               sim_air.py · linktest.py · launch_via_daemon.py · previe
 tests/               141 tests; fakes.py models the E22 module
 ```
 
+## Development
+
+From the repository root, run the tests and render screen previews:
+
+```bash
+python3 -m pytest -q
+python3 tools/preview.py
+```
+
+For behavior changes, reproduce the issue, add a focused regression test, and
+run the affected tests before the full suite. Keep the controls and screen
+behavior documented in **Using it** aligned with the real input dispatch.
+Report hardware checks as unverified when they were not run.
+
 ---
 
 ## Update 2026-09-30: MFruit OS controls and look

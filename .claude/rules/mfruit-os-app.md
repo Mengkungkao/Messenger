@@ -11,8 +11,10 @@ Source of truth: `MFruitOS/docs/APP_RULES.md`. Copies live in each app at
 `.claude/rules/mfruit-os-app.md`; change the source, then copy.
 
 Use this list when creating, developing, packaging and integrating an app.
-The detailed package format is in `MFruitOS/APP_DEVELOPMENT.md`. Current SDK
-apps declare MFruit OS **1.4.0 or newer** in their native package manifest.
+The detailed package format is in `MFruitOS/APP_DEVELOPMENT.md`. Platform
+architecture is documented in `MFruitOS/docs/ARCHITECTURE.md`, and core
+contributor workflow in `MFruitOS/CONTRIBUTING.md`. Current SDK apps declare
+MFruit OS **1.4.0 or newer** in their native package manifest.
 
 ## 1. Input: one controller, the same controls everywhere
 
