@@ -78,11 +78,15 @@ class Link:
             log.exception("packet handler failed")
 
     # --- transmit ------------------------------------------------------
-    def transmit(self, packet: pk.Packet) -> bool:
-        """Put one packet on the air. False if the duty cycle forbids it."""
+    def transmit(self, packet: pk.Packet, force: bool = False) -> bool:
+        """Put one packet on the air. False if the duty cycle forbids it.
+
+        ``force`` skips that self-imposed limit: only for a call for help,
+        which must never be held back by the budget of ordinary messages.
+        """
         frame = packet.encode()
         with self._tx_lock:
-            if not self.airtime.can_send(len(frame)):
+            if not force and not self.airtime.can_send(len(frame)):
                 log.warning("duty cycle spent: not sending %s (%.0f s until it fits)",
                             packet, self.airtime.wait_seconds(len(frame)))
                 return False

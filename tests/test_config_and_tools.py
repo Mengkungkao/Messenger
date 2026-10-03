@@ -101,3 +101,29 @@ def test_run_sh_uses_the_venv_python_wherever_the_folder_moved(tmp_path):
     assert run().strip() == "venv python main.py --headless"
     shutil.rmtree(project / ".venv")
     assert run().strip() == "system python"
+
+
+def test_a_managed_install_adopts_the_old_history_once_and_keeps_it(tmp_path, monkeypatch):
+    import config as cfg
+    old, managed = tmp_path / "old", tmp_path / "managed"
+    old.mkdir()
+    (old / "history.json").write_text('{"messages": []}')
+    (old / "ids.json").write_text('{"next": 7}')
+    monkeypatch.setattr(cfg, "legacy_data_dir", lambda: old)
+    monkeypatch.delenv("MESSENGER_DATA_DIR", raising=False)
+    monkeypatch.setenv("WHISPLAY_OS_APP_DATA", str(managed))
+    assert cfg.Config().data_dir == managed
+    assert (managed / "history.json").read_text() == '{"messages": []}'
+    assert (managed / "ids.json").read_text() == '{"next": 7}'
+    assert (old / "history.json").exists(), "the old files are kept"
+    (old / "history.json").write_text("changed later")
+    cfg.Config().data_dir
+    assert (managed / "history.json").read_text() == '{"messages": []}', "only once"
+
+
+def test_without_mfruit_os_the_old_folder_is_used_as_before(tmp_path, monkeypatch):
+    import config as cfg
+    monkeypatch.setattr(cfg, "legacy_data_dir", lambda: tmp_path / "old")
+    monkeypatch.delenv("MESSENGER_DATA_DIR", raising=False)
+    monkeypatch.delenv("WHISPLAY_OS_APP_DATA", raising=False)
+    assert cfg.Config().data_dir == tmp_path / "old"

@@ -10,8 +10,10 @@ which is what lets the same files work under either package name.
     input      InputController: button + keyboard -> the MFruit OS actions
     status     WiFi level and battery for the status bar
     ui         theme, fonts, status bar, footer hints, lists, toast, RGB565
+    radio      the shared LoRa radio: settings, Device ID, keys, contacts
+               (keyring/crypto need the cryptography package)
 
 See APP_DEVELOPMENT.md ("MFruit App SDK") and docs/APP_RULES.md.
 """
 
-SDK_VERSION = "1.2.0"
+SDK_VERSION = "1.3.0"

@@ -35,9 +35,20 @@ ACK = 0x02          # "got message ID n"; its ID is the message's
 HELLO = 0x03        # "I am here, and this is my name"; answered by HELLO_REPLY
 HELLO_REPLY = 0x04  # a HELLO that must not be answered, so two radios cannot loop
 PING = 0x05         # link test; answered by ACK, never shown
+# Pairing (see messaging/pairing.py): in the clear, only while pairing.
+PAIR = 0x06         # "I am pairing": our public key and name, broadcast
+PAIR_REQUEST = 0x07  # "pair with me": public key + our secrets sealed for you
+PAIR_ACCEPT = 0x08  # "yes": the same, back
+SECURE = 0x09       # a TEXT sealed with a pairing key; answered by ACK
+# Emergency (see messaging/emergency.py): in the clear on purpose, so any
+# messenger in range can show it and answer.
+SOS = 0x0A          # "I need help": name, battery, place, message; answered by ACK
+SOS_CLEAR = 0x0B    # "I am OK now": ends an SOS on every radio that showed it
 
 TYPE_NAMES = {TEXT: "TEXT", ACK: "ACK", HELLO: "HELLO",
-              HELLO_REPLY: "HELLO_REPLY", PING: "PING"}
+              HELLO_REPLY: "HELLO_REPLY", PING: "PING", PAIR: "PAIR",
+              PAIR_REQUEST: "PAIR_REQUEST", PAIR_ACCEPT: "PAIR_ACCEPT",
+              SECURE: "SECURE", SOS: "SOS", SOS_CLEAR: "SOS_CLEAR"}
 
 HEADER_SIZE = 9     # START, TYPE, ID(2), SRC(2), DST(2), LENGTH
 CRC_SIZE = 2

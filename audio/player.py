@@ -48,6 +48,8 @@ CUES = {
     "delivered": tone(990, 0.05) + _gap(0.03) + tone(1320, 0.05) + _gap(0.03) + tone(1760, 0.07),
     "received": tone(1320, 0.07) + _gap(0.03) + tone(880, 0.09),
     "failed": tone(300, 0.2),
+    # An SOS heard: loud two-tone siren, long enough to be noticed across a room.
+    "alarm": (tone(1760, 0.18) + tone(1175, 0.18)) * 3,
 }
 
 

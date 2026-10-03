@@ -45,8 +45,9 @@ from audio.player import Player
 from audio.recorder import Recorder
 from mfruit_sdk.input import (BACK, BUTTON, CHAR, ERASE, EXTRA, KEYBOARD, NEXT,
                               PREVIOUS, SELECT, TALK_END, TALK_START, InputController)
-from mfruit_sdk.status import StatusMonitor
+from mfruit_sdk.status import StatusMonitor, read_battery
 
+from controls import menus
 from controls.keyboard import HELP, Keyboard
 from display import board as board_module
 from display.whisplay import Bubble, Picker, Screen, View, render
@@ -54,7 +55,10 @@ from lora import modepins, protocol
 from lora.link import Link
 from lora.sx126x import PortBusy, SX126x, port_conflicts
 from messaging import history as h
+from messaging.emergency import Emergency
+from messaging.pairing import Pairing
 from messaging.receiver import Receiver
+from messaging.security import Security
 from messaging.sender import Sender
 from utils.logger import get_logger
 from utils.single_instance import AlreadyRunning, SingleInstance
@@ -97,6 +101,11 @@ class Messenger:
         self._flash = None              # (text, tone, until)
         self._statuses = {}             # id(message) -> last status seen
         self._radio_note = ""
+        self.menu = None                # menus.Menu: pairing, SOS, an alarm
+        self._countdown_until = None    # monotonic deadline of the SOS countdown
+        self._beep_at = 0.0
+        self._sos_message = None        # the SOS entry in the chat history
+        self._sos_reported = None
 
         data = config.data_dir
         self.history = h.History(data / "history.json", config.messaging.history_size)
@@ -119,7 +128,7 @@ class Messenger:
         self.armed = False
         self.input = InputController(
             self._on_action,
-            talk=lambda: self.picker is None and self.can_talk,
+            talk=lambda: self.picker is None and self.menu is None and self.can_talk,
             typing=lambda: self.compose is not None,
             active=self._has_screen,
             on_armed=self._on_armed,
@@ -140,14 +149,27 @@ class Messenger:
         # --- radio -----------------------------------------------------
         self.radio = radio if radio is not None else self._open_radio()
         self.link = self.sender = self.receiver = None
+        self.pairing = self.emergency = None
+        # The keys every radio app on this device shares (None: no encryption).
+        self.security = Security.open_shared()
         if self.radio is not None:
             self.link = Link(self.radio, config.radio.air_speed,
                              config.radio.duty_cycle_percent)
             self.sender = Sender(self.link, self.history, self.address, self.ids,
                                  config.messaging.ack_timeout_seconds,
-                                 config.messaging.max_retries, name=self.name)
+                                 config.messaging.max_retries, name=self.name,
+                                 security=self.security)
+            if self.security is not None:
+                self.pairing = Pairing(self.link, self.security, self.address, self.name,
+                                       self.ids, self.history, on_change=self._wake.set)
+            if config.emergency.enabled:
+                self.emergency = Emergency(self.link, self.address, self.ids, config.emergency,
+                                           battery=lambda: read_battery()[0], name=self.name,
+                                           on_change=self._on_emergency_change,
+                                           on_alarm=self._on_alarm)
             self.receiver = Receiver(self.link, self.sender, self.history, self.address,
-                                     on_message=self._on_received)
+                                     on_message=self._on_received, security=self.security,
+                                     pairing=self.pairing, emergency=self.emergency)
             self.link.on_packet = self.receiver.handle
             self.link.on_rssi = self._on_rssi
         self.history.subscribe(self._on_history_change)
@@ -242,9 +264,9 @@ class Messenger:
 
     def _on_talk_start(self):
         with self._lock:
-            if self.picker is not None:
-                # The reply list is not a talk screen: there a hold picks the
-                # reply, on release (the input controller never talks there).
+            if self.picker is not None or self.menu is not None:
+                # A list is not a talk screen: there a hold picks the row,
+                # on release (the input controller never talks there).
                 return
             if self.listening or self.transcribing:
                 return
@@ -301,19 +323,19 @@ class Messenger:
                 self.transcribing = False
             self._wake.set()
 
-    def send(self, text: str):
+    def send(self, text: str, dst: int | None = None):
         text = " ".join(text.split())
         if not text:
             return
+        dst = self.config.radio.peer_address if dst is None else dst
         if self.sender is None:
             # Still show what was said: the ASR half is worth testing alone.
-            self.history.add(h.Message(h.TX, 0, self.config.radio.peer_address, text,
-                                       h.FAILED))
+            self.history.add(h.Message(h.TX, 0, dst, text, h.FAILED))
             self.flash(self._radio_note or "Radio offline", "error")
             return
         with self._lock:
             self.scroll = 0
-        self.sender.send_text(text, self.config.radio.peer_address)
+        self.sender.send_text(text, dst)
         self.player.cue("sent")
 
     # ============================================================ the chat
@@ -344,18 +366,27 @@ class Messenger:
 
     # ======================================================= quick replies
     def _picker_items(self) -> list:
-        """(label, text to send, failed message to resend) for each row."""
+        """(label, text to send, failed message to resend, action) for each row."""
         items = []
         last_tx = next((m for m in reversed(self.chat()) if m.direction == h.TX), None)
         if last_tx is not None and last_tx.status == h.FAILED and last_tx.msg_id:
-            items.append((f"↻ Resend: {last_tx.text}", None, last_tx))
-        items += [(reply, reply, None) for reply in self.config.messaging.quick_replies]
+            items.append((f"↻ Resend: {last_tx.text}", None, last_tx, None))
+        items += [(reply, reply, None, None) for reply in self.config.messaging.quick_replies]
+        if self.pairing is not None:
+            items.append(("Pair a radio", None, None,
+                          lambda: self.open_menu(menus.pair_menu(self))))
+            if self.security.paired:
+                items.append(("Paired radios", None, None,
+                              lambda: self.open_menu(menus.paired_menu(self))))
+        if self.emergency is not None:
+            items.append(("SOS emergency", None, None,
+                          lambda: self.open_menu(menus.sos_menu(self))))
         return items
 
     def open_picker(self):
         with self._lock:
             self._picker_rows = self._picker_items()
-            self.picker = Picker([label for label, _, _ in self._picker_rows])
+            self.picker = Picker([row[0] for row in self._picker_rows], title="Replies")
             self._picker_until = time.monotonic() + PICKER_SECONDS
             self.compose = None
         self.screen.poke()
@@ -378,14 +409,153 @@ class Messenger:
         with self._lock:
             if self.picker is None:
                 return
-            _, text, failed = self._picker_rows[self.picker.index]
+            _, text, failed, action = self._picker_rows[self.picker.index]
             self.picker = None
-        if failed is not None:
+        if action is not None:
+            action()
+        elif failed is not None:
             if self.sender and self.sender.resend(failed):
                 self.flash("Resending", "busy")
         else:
             self.send(text)
         self._wake.set()
+
+    # ====================================================== menus and SOS
+    def open_menu(self, menu):
+        with self._lock:
+            self._drop_menu()
+            self.menu = menu
+            self.picker = None
+            self.compose = None
+        self.screen.poke()
+        self._wake.set()
+
+    def close_menu(self):
+        with self._lock:
+            self._drop_menu()
+        self._wake.set()
+
+    def _drop_menu(self):
+        menu, self.menu = self.menu, None
+        if menu is None:
+            return
+        if menu.kind == "pair" and self.pairing is not None:
+            self.pairing.stop()
+        if menu.kind == "countdown":
+            self._countdown_until = None
+
+    def _menu_items(self) -> list:
+        return list(menus.resolve(self.menu.items)) if self.menu else []
+
+    def _move_menu(self, step: int):
+        with self._lock:
+            items = self._menu_items()
+            if self.menu is not None and items:
+                self.menu.index = (self.menu.index + step) % len(items)
+        self._wake.set()
+
+    def _select_menu(self):
+        with self._lock:
+            items = self._menu_items()
+            menu = self.menu
+            action = items[min(menu.index, len(items) - 1)][1] if menu and items else None
+        if action is not None:
+            action()
+        self._wake.set()
+
+    def _back_menu(self):
+        menu = self.menu
+        if menu is not None:
+            (menu.on_back or self.close_menu)()
+        self._wake.set()
+
+    def begin_sos_countdown(self):
+        until = time.monotonic() + self.config.emergency.countdown_seconds
+        self._countdown_until = until
+        self.open_menu(menus.countdown_menu(self, until))
+        self._countdown_until = until          # open_menu dropped the previous menu's state
+        self.player.cue("failed")
+
+    def cancel_sos_countdown(self):
+        self.close_menu()
+        self.flash("SOS cancelled", "ok", 3.0)
+
+    def _start_sos(self):
+        if self.emergency is None or not self.emergency.start():
+            return
+        out = self.emergency.outgoing
+        self._sos_reported = None
+        self._sos_message = h.Message(h.TX, out.msg_id, protocol.BROADCAST,
+                                      f"SOS: {self.config.emergency.message}", h.SENDING,
+                                      attempts=1, kind="sos")
+        self.history.add(self._sos_message)
+        self.screen.poke()
+        log.warning("SOS is being sent")
+        self._wake.set()
+
+    def _on_emergency_change(self):
+        """From the SOS worker or the radio: note delivery, wake the screen loop."""
+        out = self.emergency.outgoing if self.emergency else None
+        message = self._sos_message
+        if out is not None and message is not None and out.ackers and message.status != h.DELIVERED:
+            self.history.update(message, status=h.DELIVERED, acked_by=sorted(out.ackers)[0])
+        self._wake.set()
+
+    def _on_alarm(self, alarm):
+        """An SOS from another radio (called from the radio thread)."""
+        if alarm.name and alarm.src not in self.history.names:
+            self.history.set_name(alarm.src, alarm.name)
+        self.history.add(h.Message(h.RX, alarm.msg_id, alarm.src, f"SOS: {alarm.message}",
+                                   h.RECEIVED, attempts=1, rssi=alarm.rssi, kind="sos"))
+        self.screen.poke()
+        self._wake.set()
+
+    def _sync(self, now: float):
+        """Follow state that changes without a button: the pairing window, the
+        SOS countdown, alarms heard, the end of our own SOS."""
+        menu = self.menu
+        if self.pairing is not None and self.pairing.active:
+            self.pairing.tick()
+        if menu is not None and menu.kind == "pair":
+            done = self.pairing.result.startswith("Paired")
+            if done or not self.pairing.active:
+                result = self.pairing.result or "Pairing closed"
+                self.close_menu()
+                self.flash(result, "ok" if done else "error", 4.0)
+                if done:
+                    self.player.cue("delivered")
+        if self._countdown_until is not None and now >= self._countdown_until:
+            self._countdown_until = None
+            self.close_menu()
+            self._start_sos()
+        sos = self.emergency
+        if sos is None:
+            return
+        out = sos.outgoing
+        if out is not None and out.done and self._sos_reported is not out:
+            self._sos_reported = out
+            self.flash(out.note or "SOS ended", "ok" if "OK" in out.note else "error", 8.0)
+            if self.menu is not None and self.menu.kind == "sos":
+                self.close_menu()
+        if sos.active:
+            return                       # our own call for help comes first
+        menu = self.menu
+        if menu is not None and menu.kind == "alarm":
+            alarm = menu.data
+            if alarm.cleared or alarm.dismissed:
+                self.close_menu()
+                if alarm.cleared:
+                    self.flash(f"{alarm.name or 'A radio'}: I'm OK", "ok", 8.0)
+                    self.player.cue("delivered")
+            elif now >= self._beep_at:
+                self.player.cue("alarm")
+                self._beep_at = now + menus.ALARM_BEEP_SECONDS
+            return
+        pending = sos.active_alarms()
+        if pending:
+            self.open_menu(menus.alarm_menu(self, pending[0]))
+            self.player.cue("alarm")
+            self._beep_at = now + menus.ALARM_BEEP_SECONDS
 
     # =============================================================== input
     def _on_armed(self, armed: bool):
@@ -424,7 +594,15 @@ class Messenger:
     def _on_button(self, name: str):
         with self._lock:
             picking, composing = self.picker is not None, self.compose is not None
-        if picking:
+            in_menu = self.menu is not None
+        if in_menu:
+            if name in (NEXT, PREVIOUS):
+                self._move_menu(+1 if name == NEXT else -1)
+            elif name == SELECT:
+                self._select_menu()
+            elif name == BACK:
+                self._back_menu()
+        elif picking:
             if name in (NEXT, PREVIOUS):
                 self._move_picker(+1 if name == NEXT else -1)
             elif name == SELECT:
@@ -435,6 +613,9 @@ class Messenger:
             if composing:
                 with self._lock:
                     self.compose = None     # four clicks go back: first out of typing
+            elif self.emergency is not None and self.emergency.active:
+                # Leaving would silence our own call for help.
+                self.open_menu(menus.sos_menu(self))
             else:
                 self.stop("four clicks")
         elif name == NEXT:
@@ -479,7 +660,16 @@ class Messenger:
     def _on_key(self, action):
         with self._lock:
             composing, picking = self.compose is not None, self.picker is not None
+            in_menu = self.menu is not None
         name = action.name
+        if in_menu:
+            if name in (NEXT, PREVIOUS):
+                self._move_menu(+1 if name == NEXT else -1)
+            elif name == SELECT:
+                self._select_menu()
+            elif name == BACK:
+                self._back_menu()
+            return                       # typing never closes an alarm
         if name == CHAR:
             self._on_char(action.char)
         elif name == ERASE:
@@ -501,6 +691,8 @@ class Messenger:
                     self.compose = None
             elif picking:
                 self.close_picker()
+            elif self.emergency is not None and self.emergency.active:
+                self.open_menu(menus.sos_menu(self))
             else:
                 self.stop("Esc")
         elif name in (NEXT, PREVIOUS):
@@ -576,9 +768,12 @@ class Messenger:
             return f"Listening… {self.recorder.elapsed:.1f}s", "listen"
         if self.transcribing:
             return "Converting speech…", "busy"
+        if self.emergency is not None and self.emergency.active and self.menu is None:
+            heard = self.emergency.heard_by
+            return (f"SOS · heard by {heard}" if heard else "SOS · calling for help…"), "alarm"
         if flash and flash[2] > time.monotonic():
             return flash[0], flash[1]
-        if self.compose is not None or self.picker is not None:
+        if self.compose is not None or self.picker is not None or self.menu is not None:
             return "", "idle"
         if self._radio_note:
             return self._radio_note, "error"
@@ -592,6 +787,8 @@ class Messenger:
         """What the button (and Enter / Esc) do right now, for the footer."""
         if self.compose is not None:
             return HINTS_TYPING
+        if self.menu is not None:
+            return [("release", "to select")] if self.armed else HINTS_PICKER
         if self.picker is not None:
             return [("release", "to send")] if self.armed else HINTS_PICKER
         selected = self.selected()
@@ -607,13 +804,22 @@ class Messenger:
             chat = self.chat()
             anchor = len(chat) - 1 - self.scroll if self.scroll else None
             senders = {m.peer for m in chat if m.direction == h.RX}
+            paired = set(self.security.paired) if self.security is not None else set()
             view.bubbles = [bubble(m, self.history, len(senders) > 1,
-                                   selected=anchor is not None and index == anchor)
+                                   selected=anchor is not None and index == anchor,
+                                   paired=paired)
                             for index, m in enumerate(chat)]
             view.anchor = anchor
             if anchor is not None:
                 view.position = f"{anchor + 1}/{len(chat)}"
             view.picker = self.picker
+            if self.menu is not None:
+                items = self._menu_items()
+                view.picker = Picker([label for label, _ in items],
+                                     min(self.menu.index, max(0, len(items) - 1)),
+                                     title=str(menus.resolve(self.menu.title)),
+                                     lines=list(menus.resolve(self.menu.lines) or ()),
+                                     tone=self.menu.tone)
             view.compose = self.compose
         view.title = self._title(chat)
         view.empty_hint = (["No messages yet", "Hold to talk",
@@ -622,6 +828,8 @@ class Messenger:
         if self.input.keyboard_connected:
             view.empty_hint.append("or type, and Enter sends")
         view.status, view.status_tone = self._status()
+        if self.menu is not None and self.menu.tone == "alarm":
+            view.status_tone = "alarm"      # the LED, even with no status pill
         view.hints = self._hints()
         view.device = self.status.sample()
         if self.listening:
@@ -640,6 +848,14 @@ class Messenger:
             waits.append(max(0.05, self._flash[2] - time.monotonic() + 0.01))
         if self.picker is not None:
             waits.append(max(0.05, self._picker_until - time.monotonic()))
+        now = time.monotonic()
+        if self._countdown_until is not None:
+            waits.append(min(1.0, max(0.05, self._countdown_until - now)))
+        if self.menu is not None and self.menu.kind == "alarm":
+            waits.append(max(0.05, self._beep_at - now))
+        if self.pairing is not None and self.pairing.active:
+            due = self.pairing.next_due()
+            waits.append(1.0 if due is None else min(1.0, max(0.05, due - now)))
         wait = min(waits)
         return None if wait == float("inf") else wait
 
@@ -648,6 +864,8 @@ class Messenger:
         if self.link:
             self.link.start()
             self.sender.start()
+        if self.emergency is not None:
+            self.emergency.start_worker()
         self.input.start()
         self.status.start()
         if not isinstance(self.asr, NoEngine):
@@ -686,6 +904,7 @@ class Messenger:
             self._flash = None
         if self.picker is not None and self._picker_until <= now:
             self.close_picker()
+        self._sync(now)
 
     def stop(self, reason: str = "normal"):
         log.info("stopping (%s)", reason)
@@ -696,6 +915,10 @@ class Messenger:
         self.recorder.close()
         self.input.stop()
         self.status.stop()
+        if self.emergency is not None:
+            if self.emergency.active:
+                log.warning("stopping while an SOS was being sent: it stops here")
+            self.emergency.stop_worker()
         if self.sender:
             self.sender.stop()
         if self.link:
@@ -714,17 +937,23 @@ class Messenger:
 
 
 def bubble(message: h.Message, history: h.History, show_sender: bool = False,
-           selected: bool = False) -> Bubble:
+           selected: bool = False, paired=frozenset()) -> Bubble:
     """One message as the chat shows it."""
     clock = time.strftime("%H:%M", time.localtime(message.created))
     part = f" · part {message.part}" if message.part else ""
+    sealed = " · encrypted" if message.secure else ""
     if message.direction == h.RX:
         signal_part = f" · {message.rssi} dBm" if message.rssi is not None else ""
-        return Bubble(message.text, False, f"{clock}{signal_part}{part}",
+        # A plain message that claims to come from a radio we paired with
+        # should have been sealed: say so rather than trust it.
+        downgraded = not message.secure and message.kind == "text" and message.peer in paired
+        tone = "error" if downgraded or message.kind == "sos" else "dim"
+        note = " · NOT encrypted" if downgraded else sealed
+        return Bubble(message.text, False, f"{clock}{signal_part}{note}{part}", tone,
                       sender=history.name_for(message.peer) if show_sender else "",
                       selected=selected)
     if message.status == h.DELIVERED:
-        meta, tone = f"{clock} ✓{part}", "ok"
+        meta, tone = f"{clock} ✓{sealed}{part}", "ok"
     elif message.status == h.FAILED:
         meta, tone = f"{clock} ✗ not confirmed{part}", "error"
     elif message.status == h.SENDING:

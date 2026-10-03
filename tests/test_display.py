@@ -199,3 +199,28 @@ def test_the_footer_shows_hints_until_there_is_something_to_say():
     assert idle.crop(footer).tobytes() != listening.crop(footer).tobytes()
     assert any(colour_at(listening, WIDTH // 2, y) == (255, 92, 92) or
                colour_at(listening, 20, y) == THEME.error for y in range(STATUS_TOP, HEIGHT))
+
+
+def fake_reads(monkeypatch, pattern):
+    from lora import modepins
+    reads = iter(pattern)
+    monkeypatch.setattr(modepins, "_read", lambda m0, m1: next(reads))
+    return modepins
+
+
+def test_m1_high_only_while_frames_are_drawn_is_not_deaf(monkeypatch):
+    """MFruit OS parks the LCD's DC line (M1) low between frames; a sample
+    taken while the app draws its first screens catches a few frames."""
+    modepins = fake_reads(monkeypatch, [(0, 1, 1, 1) if i == 3 else (0, 0, 1, 1)
+                                        for i in range(12)])
+    result = modepins.sample(samples=12, seconds=0)
+    assert result["transparent"] and result["frames_only"]
+    assert result["detail"] == "M1 high only during screen updates (8% of the time)"
+
+
+def test_m1_left_high_by_the_display_driver_is_deaf(monkeypatch):
+    """Upstream Whisplay leaves DC high after every frame: configuration mode."""
+    modepins = fake_reads(monkeypatch, [(0, 1, 1, 1)] * 12)
+    result = modepins.sample(samples=12, seconds=0)
+    assert not result["transparent"] and not result["frames_only"]
+    assert result["detail"] == "module is in configuration mode (100% of the time)"

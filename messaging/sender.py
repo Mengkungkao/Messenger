@@ -41,7 +41,8 @@ LATE_ACK_LOOKBACK = 20
 class Sender:
     def __init__(self, link, history: h.History, address: int,
                  ids: protocol.MessageIds, ack_timeout: float = 3.0,
-                 max_retries: int = 3, name: str = ""):
+                 max_retries: int = 3, name: str = "", security=None):
+        self.security = security      # messaging.security.Security, or None: no encryption
         self.link = link
         self.history = history
         self.address = address
@@ -80,12 +81,16 @@ class Sender:
     # --- API -----------------------------------------------------------
     def send_text(self, text: str, dst: int = protocol.BROADCAST) -> list:
         """Queue `text` for `dst`. Returns the history entries, one per packet."""
-        chunks = protocol.split_text(text)
+        sealed = self.security is not None and self.security.can_seal_to(dst)
+        # A sealed packet carries the nonce salt and tag; keep it inside one packet.
+        chunks = protocol.split_text(
+            text, pk.MAX_MESSAGE - (self.security.overhead if sealed else 0))
         messages = []
         for index, chunk in enumerate(chunks):
             message = h.Message(
                 h.TX, self.ids.next(), dst, chunk, h.QUEUED,
                 part=f"{index + 1}/{len(chunks)}" if len(chunks) > 1 else "",
+                secure=sealed,
             )
             self.history.add(message)
             self._queue.put(message)
@@ -135,9 +140,27 @@ class Sender:
                 log.exception("sending #%d failed", message.msg_id)
                 self.history.update(message, status=h.FAILED)
 
+    def _packet_for(self, message: h.Message):
+        """The packet for a queued message: sealed if it was queued sealed.
+
+        A message queued as secure is never silently sent in the clear: if
+        its key has gone (the radio was unpaired meanwhile) it fails instead.
+        """
+        if message.secure:
+            if self.security is None or not self.security.can_seal_to(message.peer):
+                log.warning("#%d was queued encrypted but its key is gone; not sent",
+                            message.msg_id)
+                return None
+            packet, _ = self.security.text_packet(self.address, message.peer, message.msg_id,
+                                                  message.text)
+            return packet
+        return protocol.text_packet(self.address, message.peer, message.msg_id, message.text)
+
     def _deliver(self, message: h.Message):
-        packet = protocol.text_packet(self.address, message.peer, message.msg_id,
-                                      message.text)
+        packet = self._packet_for(message)
+        if packet is None:
+            self.history.update(message, status=h.FAILED)
+            return
         in_flight = self.link.round_trip_seconds(len(packet.encode()), pk.OVERHEAD)
         with self._lock:
             self._pending = message

@@ -45,6 +45,8 @@ class Message:
     rtt_ms: int | None = None  # TX: send-to-ACK time of the delivering attempt
     acked_by: int | None = None  # TX: who ACKed it -- the radio, for a broadcast
     part: str = ""             # "1/2" when a transcript was split
+    secure: bool = False       # sealed with a pairing key (False: anyone in range could read it)
+    kind: str = "text"         # text | sos | ok
 
     @property
     def key(self) -> tuple:

@@ -9,6 +9,7 @@ an empty config.yaml. Environment variables win over the file:
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import zlib
 from dataclasses import dataclass, field, fields
@@ -83,6 +84,26 @@ class MessagingConfig:
 
 
 @dataclass
+class EmergencyConfig:
+    # The SOS function (docs/EMERGENCY.md). It is a call for help over a
+    # LoRa link, not a certified emergency service: range depends on
+    # terrain, and nobody may be listening.
+    enabled: bool = True
+    # What responders read, and where you are in your own words: there is no
+    # GPS. Edit these before a trip ("North ridge camp, blue tent").
+    message: str = "Need help"
+    place: str = ""
+    # Seconds the screen counts down before sending; four clicks cancel.
+    countdown_seconds: int = 5
+    # Repeat every this many seconds until a radio answers, then more slowly,
+    # until you press "I'm OK". SOS ignores the duty-cycle limit.
+    first_interval_seconds: float = 10.0
+    interval_seconds: float = 60.0
+    # An SOS nobody cancelled stops after this many hours (battery).
+    max_hours: float = 12.0
+
+
+@dataclass
 class AudioConfig:
     capture_device: str = "auto"
     playback_device: str = "auto"
@@ -144,6 +165,7 @@ class Config:
     radio: RadioConfig = field(default_factory=RadioConfig)
     identity: IdentityConfig = field(default_factory=IdentityConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
+    emergency: EmergencyConfig = field(default_factory=EmergencyConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
     tts: TtsConfig = field(default_factory=TtsConfig)
@@ -153,14 +175,48 @@ class Config:
 
     @property
     def data_dir(self) -> Path:
-        path = Path(os.getenv(f"{ENV_PREFIX}DATA_DIR",
-                              Path.home() / ".lora-messenger"))
+        # Under MFruit OS a managed package keeps its data where updates and
+        # rollbacks snapshot it (WHISPLAY_OS_APP_DATA); otherwise ~/.lora-messenger.
+        managed = not os.getenv(f"{ENV_PREFIX}DATA_DIR") and os.getenv("WHISPLAY_OS_APP_DATA")
+        path = Path(os.getenv(f"{ENV_PREFIX}DATA_DIR") or managed or legacy_data_dir())
         path.mkdir(parents=True, exist_ok=True)
+        if managed:
+            adopt_legacy_data(path)
         return path
 
     def sections(self) -> dict:
         return {spec.name: getattr(self, spec.name)
                 for spec in fields(self) if spec.name != "source"}
+
+
+def legacy_data_dir() -> Path:
+    return Path.home() / ".lora-messenger"
+
+
+LEGACY_FILES = ("history.json", "ids.json")
+
+
+def adopt_legacy_data(path: Path, legacy: Path | None = None) -> bool:
+    """Copy the chat history and message IDs an earlier build kept in
+    ~/.lora-messenger into MFruit OS's data folder, once.
+
+    Copied, never moved: the old files stay, so going back to an older build
+    loses nothing. Nothing happens once the data folder has a history.
+    """
+    legacy = legacy or legacy_data_dir()
+    if (path / "history.json").exists() or not (legacy / "history.json").is_file() \
+            or legacy.resolve() == path.resolve():
+        return False
+    for name in LEGACY_FILES:
+        source = legacy / name
+        if source.is_file() and not (path / name).exists():
+            try:
+                shutil.copy2(source, path / name)
+            except OSError as exc:
+                log.warning("could not copy %s from %s: %s", name, legacy, exc)
+                return False
+    log.info("copied the chat history from %s (the old files are kept)", legacy)
+    return True
 
 
 def hostname() -> str:
@@ -228,8 +284,24 @@ def module_settings(path: Path | str | None = None) -> dict:
     return found
 
 
+def shared_module_settings() -> dict:
+    """What MFruit OS's radio setup provisioned (the shared radio store), if any."""
+    try:
+        from mfruit_sdk.radio.settings import load_radio
+        provisioned = load_radio()
+    except Exception as exc:          # an older SDK copy, or an unreadable store
+        log.debug("no shared radio settings: %s", exc)
+        return {}
+    if provisioned is None:
+        return {}
+    return {"frequency_mhz": provisioned.frequency_mhz, "air_speed": provisioned.air_speed,
+            "port": provisioned.port}
+
+
 def _normalise_module(radio: RadioConfig):
-    walkie = None
+    # "auto": MFruit OS's shared radio settings, else WalkieTalkie's config.yaml
+    # next to us (older installs), else the defaults.
+    provisioned = None
     for key, default in MODULE_DEFAULTS.items():
         value = getattr(radio, key)
         if not _is_auto(value):
@@ -238,9 +310,20 @@ def _normalise_module(radio: RadioConfig):
                 continue
             except (TypeError, ValueError):
                 log.warning("radio.%s %r is not a number; using auto", key, value)
-        if walkie is None:
-            walkie = module_settings()
-        setattr(radio, key, walkie.get(key, default))
+        if provisioned is None:
+            provisioned = shared_module_settings() or module_settings()
+        setattr(radio, key, provisioned.get(key, default))
+
+
+def shared_device_address(legacy: int, name: str) -> int:
+    try:
+        from mfruit_sdk.radio import legacy as walkie
+        from mfruit_sdk.radio.settings import load_device
+        walkie.adopt_walkietalkie()     # a Device ID WalkieTalkie already uses comes first
+        return load_device(legacy_address=legacy or None, legacy_name=name).address
+    except Exception as exc:          # an older SDK copy, or an unwritable store
+        log.warning("shared Device ID unavailable (%s); using %d", exc, legacy)
+        return legacy
 
 
 def _quick_replies(items) -> list:
@@ -259,6 +342,14 @@ def _normalise(config: Config):
     _normalise_module(config.radio)
     config.messaging.quick_replies = _quick_replies(config.messaging.quick_replies)
     config.ui.chat_messages = max(1, int(config.ui.chat_messages or 10))
+    emergency = config.emergency
+    emergency.message = " ".join(str(emergency.message or "Need help").split())[:60]
+    emergency.place = " ".join(str(emergency.place or "").split())[:60]
+    emergency.countdown_seconds = max(2, min(30, int(emergency.countdown_seconds or 5)))
+    emergency.first_interval_seconds = max(5.0, float(emergency.first_interval_seconds or 10.0))
+    emergency.interval_seconds = max(emergency.first_interval_seconds,
+                                     float(emergency.interval_seconds or 60.0))
+    emergency.max_hours = max(0.5, float(emergency.max_hours or 12.0))
     if _is_auto(config.identity.name):
         config.identity.name = hostname()
     config.identity.name = str(config.identity.name)[:24]
@@ -273,8 +364,13 @@ def _normalise(config: Config):
             log.warning("radio.address %r is not 0-65534; deriving one",
                         config.radio.address)
             address = None
-    config.radio.address = (address_for(config.identity.name)
-                            if _is_auto(address) else address)
+    if _is_auto(address):
+        # The Device ID every radio app on this device shares (MFruit OS's
+        # shared radio store), so a pairing made in WalkieTalkie holds here
+        # too. The first app to run hands over the ID it used before.
+        address = shared_device_address(address_for(config.identity.name),
+                                        config.identity.name)
+    config.radio.address = address
 
     peer = config.radio.peer_address
     try:

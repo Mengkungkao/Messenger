@@ -137,15 +137,24 @@ def sample(m0: int = DEFAULT_M0, m1: int = DEFAULT_M1,
     others = [pair for pair in seen if pair != (0, 0)]
     worst = max(set(others), key=others.count) if others else (0, 0)
     name, usable = MODES.get(worst, (f"M0={worst[0]} M1={worst[1]}", False))
+    # M1 alone, high a minority of the time, is the LCD's DC line clocking
+    # frames (MFruit OS parks it low between them): the radio misses ~11 ms
+    # per frame, which this app accepts by drawing only on change. M1 high
+    # most or all of the time is a driver that leaves DC up -- deaf.
+    frames_only = bool(others) and set(others) == {(0, 1)} and fraction >= 0.5
+    transparent = fraction > 0.95 or frames_only
     return {
         "readable": True,
-        "transparent": fraction > 0.95,
+        "transparent": transparent,
+        "frames_only": frames_only,
         "fraction": fraction,
         "mode": name,
         "usable": usable,
         "levels": worst,
         "detail": (
             "mode pins are transparent" if fraction > 0.95 else
+            f"M1 high only during screen updates ({int((1 - fraction) * 100)}% of the time)"
+            if frames_only else
             f"module is in {name} mode ({int((1 - fraction) * 100)}% of the time)"
         ),
     }

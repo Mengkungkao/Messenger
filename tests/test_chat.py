@@ -44,6 +44,7 @@ def queued(app, text):
 
 # MFruit OS input actions, named after the button gesture that makes them.
 TAP, TWICE, HOLD, THRICE, QUAD = NEXT, PREVIOUS, SELECT, EXTRA, BACK
+BACK_ACTION = BACK
 CODES = {"enter": 28, "escape": 1, "backspace": 14, "tab": 15, "up": 103, "down": 108,
          "space": 57}
 
@@ -146,7 +147,7 @@ def test_the_footer_says_release_while_a_hold_is_armed(app):
 
 def test_the_list_wraps_and_closes_itself(app):
     app.open_picker()
-    for _ in range(len(app.config.messaging.quick_replies)):
+    for _ in range(len(app.picker.items)):      # the replies, then the Pair and SOS rows
         press(app, TAP)
     assert app.picker.index == 0
     app._expire(now=time.monotonic() + main_module.PICKER_SECONDS + 1)

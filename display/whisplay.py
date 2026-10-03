@@ -66,12 +66,15 @@ THEIRS = (40, 45, 55)       # received bubble
 MINE = (30, 96, 186)        # sent bubble
 MINE_FAILED = (120, 40, 48)
 
-TONES = {"idle": SURFACE, "listen": DANGER, "busy": WARN, "ok": OK, "error": DANGER}
-TONE_TEXT = {"idle": TEXT, "listen": BG, "busy": BG, "ok": BG, "error": BG}
+ALARM = (255, 52, 52)       # an SOS: sending one, or hearing one
+ALARM_BG = (58, 10, 14)
+TONES = {"idle": SURFACE, "listen": DANGER, "busy": WARN, "ok": OK, "error": DANGER,
+         "alarm": ALARM}
+TONE_TEXT = {"idle": TEXT, "listen": BG, "busy": BG, "ok": BG, "error": BG, "alarm": (255, 255, 255)}
 META_TONES = {"dim": DIM, "ok": OK, "busy": WARN, "error": DANGER}
 
 LED = {"idle": (0, 6, 10), "listen": (60, 0, 0), "busy": (40, 24, 0),
-       "ok": (0, 40, 16), "error": (60, 0, 0)}
+       "ok": (0, 40, 16), "error": (60, 0, 0), "alarm": (255, 0, 0)}
 
 # Layout, in pixels: MFruit OS's status bar above, its footer below.
 CONTENT_TOP, CONTENT_BOTTOM = mfruit.CONTENT_TOP, mfruit.CONTENT_BOTTOM
@@ -105,10 +108,13 @@ class Bubble:
 
 @dataclass
 class Picker:
-    """The quick-reply list, over the chat."""
+    """A list over the chat: quick replies, pairing, SOS. ``lines`` are
+    information shown above the rows; ``tone`` "alarm" is the red SOS look."""
     items: list
     index: int = 0
     title: str = "Quick reply"
+    lines: list = field(default_factory=list)
+    tone: str = "idle"
 
 
 @dataclass
@@ -261,10 +267,19 @@ def _compose(c: Canvas, text: str, bottom: int) -> int:
     return top
 
 
+LINE_STEP = 18
+
+
 def _picker(c: Canvas, picker: Picker, top: int, bottom: int):
-    c.rect((0, top, WIDTH, bottom), BG)
+    alarm = picker.tone == "alarm"
+    c.rect((0, top, WIDTH, bottom), ALARM_BG if alarm else BG)
+    y = top + 3
+    for line in picker.lines[:5]:
+        c.text(14, y, line, 14 if alarm else 13, "semibold" if alarm else "regular",
+               (255, 255, 255) if alarm else DIM, max_width=WIDTH - 28)
+        y += LINE_STEP
     rows = [Row(str(item)) for item in picker.items]
-    draw_list(c, rows, picker.index, top=top, bottom=bottom)
+    draw_list(c, rows, picker.index, top=y + 2 if picker.lines else top, bottom=bottom)
 
 
 def _status(c: Canvas, view: View):
@@ -280,6 +295,8 @@ def _status(c: Canvas, view: View):
 
 def render(view: View) -> Image.Image:
     c = Canvas(theme=THEME)
+    if view.picker is not None and view.picker.tone == "alarm":
+        c.rect((0, 0, WIDTH, HEIGHT), ALARM_BG)
     title = view.picker.title if view.picker is not None else view.title
     status_bar(c, title, view.device, title_sizes=TITLE_SIZES)
     bottom = CONTENT_BOTTOM
